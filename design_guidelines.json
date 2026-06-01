@@ -1,0 +1,78 @@
+{
+  "theme": "dark",
+  "archetype": "Archetype 4 (Swiss & High-Contrast) + Financial Terminal",
+  "colors": {
+    "background": "#0A0A0A",
+    "surface": "#121212",
+    "surface_hover": "#1A1A1A",
+    "primary": "#FF8C00",
+    "primary_hover": "#FF9D2E",
+    "secondary": "#222222",
+    "text_main": "#F3F4F6",
+    "text_muted": "#9CA3AF",
+    "border": "#27272A",
+    "success": "#10B981",
+    "error": "#EF4444",
+    "warning": "#F59E0B",
+    "terminal_green": "#22C55E",
+    "terminal_red": "#EF4444"
+  },
+  "typography": {
+    "font_family": {
+      "heading": "Chivo",
+      "body": "Inter",
+      "mono": "IBM Plex Mono"
+    },
+    "guidelines": "Headings must use Chivo with tight tracking (tracking-tight). All tabular data, numbers, KPIs, and status indicators MUST use IBM Plex Mono for perfect column alignment and the 'terminal' feel. Do not use Inter for headings."
+  },
+  "layout_spacing": {
+    "strategy": "Dense, modular grid. 'Control Room' protocol for the dashboard. Use generous spacing (p-12 to p-24) on the marketing landing page, but strict, compact spacing (p-4 to p-6) on the app dashboard.",
+    "dashboard_grid": "Use grid-cols-1 md:grid-cols-3 lg:grid-cols-4 or up to 12-col grids. No soft drop shadows; use 1px solid borders (border-border).",
+    "border_radius": "rounded-none or max rounded-sm (2px-4px). Sharp corners emphasize the precision and rigor of the finance domain."
+  },
+  "components": {
+    "cards": "Flat, no shadows, 1px solid border (#27272A). Background is pure surface color (#121212).",
+    "buttons": "Primary: Flat amber background (#FF8C00) with black text. Secondary: Transparent with 1px border. Hover states: Lighter amber or background color change.",
+    "tables": "First-class citizens. Dense rows, monospace font for numbers, right-aligned for financial metrics, 1px borders separating rows.",
+    "terminal_motifs": "Include a ticker-style status bar at the top or bottom of the dashboard. Use blinking cursor animations (via CSS keyframes) in the search bar or command palette."
+  },
+  "icons": {
+    "library": "@phosphor-icons/react",
+    "guidelines": "Use dense dashboards and developer tools optimized icons. Weight should be regular or bold depending on emphasis. No soft/rounded icons."
+  },
+  "images": {
+    "hero_bg": {
+      "url": "https://static.prod-images.emergentagent.com/jobs/dca0f65a-6270-4c83-83bc-e84806831efa/images/2616361f985978f68ce524526491f0758c9b4d0250d763bdb10ace05bd1f860d.png",
+      "description": "Abstract dark architectural blueprint intersecting with glowing amber financial data streams, 3D render, dark mode background. Use in landing page hero section behind a dark gradient overlay (bg-black/60)."
+    },
+    "document_audit": {
+      "url": "https://static.prod-images.emergentagent.com/jobs/dca0f65a-6270-4c83-83bc-e84806831efa/images/85b1c9f22c83319d9303ee62c41bd0e8e4ce91ce41c1d5ee126a90c637f51221.png",
+      "description": "Macro close-up of a legal financial document with glowing orange highlights and data extraction brackets. Use for the PDF Drag-and-drop feature section or deal detail page on the landing site."
+    },
+    "data_viz": {
+      "url": "https://static.prod-images.emergentagent.com/jobs/dca0f65a-6270-4c83-83bc-e84806831efa/images/324110632d6f030527cad24d7d52b9d7693a90766266fa39bff3b172711b6638.png",
+      "description": "High-end 3D rendering of complex financial charts and data nodes in deep charcoal and bright amber orange. Use for the 'Analytics/Financial Extract' features section."
+    },
+    "market_chart_1": {
+      "url": "https://images.unsplash.com/photo-1611974789855-9c2a0a7236a3?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1NTJ8MHwxfHNlYXJjaHwyfHxmaW5hbmNpYWwlMjBkYXRhJTIwY2hhcnQlMjBkYXJrfGVufDB8fHx8MTc4MDMzMzM1OHww&ixlib=rb-4.1.0&q=85",
+      "description": "Stock market candlestick chart on dark screen. Good for secondary feature visuals or background texture in the dashboard."
+    }
+  },
+  "motion": {
+    "hover": "Instant or very fast transitions (150ms). Finance professionals prefer speed over floaty animations.",
+    "terminal": "Blinking cursor for command lines (animate-pulse). Ticker tape animations for real-time market data."
+  },
+  "instructions_to_main_agent": [
+    "Strictly adhere to the dark theme (Bloomberg terminal inspired) using #0A0A0A background and #FF8C00 (Amber) accent.",
+    "Use Chivo for headings and IBM Plex Mono for all data/tables. Use Inter only for standard body text.",
+    "Do not use card shadows (shadow-sm, etc.). Rely on 1px solid borders (border-[#27272A]) for layout separation.",
+    "For the Landing Page, implement a hero section with the `hero_bg` image, heavily overlayed with bg-black/70. Do not center everything; use aggressive asymmetrical grid layouts.",
+    "Use typographic logos for trusted banks (e.g., 'LAZARD', 'EVERCORE', 'CENTERVIEW') in muted mono font instead of generic placeholder images.",
+    "Implement a command-palette style search or input on the dashboard.",
+    "For the dashboard grid, use dense layouts: 'Control Room' protocol. Utilize all available space efficiently.",
+    "All tabular data must be perfectly aligned (numbers right-aligned) and use monospace fonts.",
+    "Ensure all interactive elements have data-testid attributes (e.g., data-testid='upload-pdf-dropzone').",
+    "No purple gradients. No rounded corners (rounded-none or max rounded-sm).",
+    "Avoid glassmorphism for widgets. Use solid dark backgrounds with crisp borders for maximum data clarity."
+  ]
+}
