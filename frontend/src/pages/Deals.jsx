@@ -1,0 +1,84 @@
+import { useEffect, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
+import AppLayout from "@/components/AppLayout";
+import api from "@/lib/api";
+import { Briefcase } from "lucide-react";
+
+export default function Deals() {
+  const [deals, setDeals] = useState([]);
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    api.get("/deals").then(({ data }) => setDeals(data));
+  }, []);
+
+  return (
+    <AppLayout>
+      <div className="px-6 py-6">
+        <div className="flex items-end justify-between border-b border-[var(--cv-border)] pb-5">
+          <div>
+            <div className="cv-tag">// DEAL BOOK</div>
+            <h1 className="mt-2 font-heading text-3xl font-bold tracking-tight md:text-4xl">
+              All mandates
+            </h1>
+          </div>
+          <Link
+            to="/upload"
+            className="bg-[var(--cv-primary)] px-3 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-black hover:bg-[var(--cv-primary-hover)]"
+          >
+            Ingest a PDF
+          </Link>
+        </div>
+
+        <div className="mt-6 border border-[var(--cv-border)] bg-[var(--cv-surface)]">
+          <table className="w-full font-mono text-xs">
+            <thead>
+              <tr className="border-b border-[var(--cv-border)] text-left text-[var(--cv-muted)]">
+                <th className="px-4 py-3">Project</th>
+                <th className="px-4 py-3">Target</th>
+                <th className="px-4 py-3">Sector</th>
+                <th className="px-4 py-3 text-right">Size</th>
+                <th className="px-4 py-3 text-right">Docs</th>
+                <th className="px-4 py-3 text-right">Flags</th>
+                <th className="px-4 py-3">Created</th>
+              </tr>
+            </thead>
+            <tbody>
+              {deals.length === 0 && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-16 text-center text-[var(--cv-muted)]">
+                    <div className="mb-3 flex justify-center">
+                      <Briefcase className="h-8 w-8 opacity-60" />
+                    </div>
+                    No deals yet. Head to the dashboard and create your first mandate.
+                  </td>
+                </tr>
+              )}
+              {deals.map((d) => (
+                <tr
+                  key={d.id}
+                  onClick={() => navigate(`/deals/${d.id}`)}
+                  className="cursor-pointer border-b border-[var(--cv-border)]/60 hover:bg-[var(--cv-surface-hover)]"
+                >
+                  <td className="px-4 py-3 text-[var(--cv-text)]">{d.name}</td>
+                  <td className="px-4 py-3 text-[var(--cv-muted)]">{d.target_company}</td>
+                  <td className="px-4 py-3 text-[var(--cv-muted)]">{d.sector}</td>
+                  <td className="px-4 py-3 text-right">{d.deal_size || "—"}</td>
+                  <td className="px-4 py-3 text-right">{d.documents_count}</td>
+                  <td
+                    className={`px-4 py-3 text-right ${
+                      d.red_flags_count > 0 ? "text-[var(--cv-primary)]" : "text-[var(--cv-muted)]"
+                    }`}
+                  >
+                    {d.red_flags_count}
+                  </td>
+                  <td className="px-4 py-3 text-[var(--cv-muted)]">{d.created_at?.slice(0, 10)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </AppLayout>
+  );
+}

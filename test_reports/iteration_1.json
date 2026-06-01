@@ -1,0 +1,58 @@
+{
+  "summary": "Full backend API smoke + integration suite for ClearVault. 26 pytest tests run against the public preview URL, covering health, signup/login/me, deal CRUD, PDF upload + background Gemini extraction (completed in ~10s), dashboard stats, recent activity, cross-user authorization (negative tests for other-user access), and cascade deletion. 26/26 passed.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/auth/signup",
+        "issue": "Pydantic v2 EmailStr rejects the suggested test domain `*.test` ('special-use or reserved' TLD), returning HTTP 422. The credential `analyst@clearvault.test` documented in /app/memory/test_credentials.md cannot actually be created. Either relax email validation (use a permissive validator) or update the doc to a non-reserved domain (e.g. clearvault.io). I worked around it in the test suite by using `clearvault.io`."
+      },
+      {
+        "endpoint": "/api/deals/{deal_id}",
+        "issue": "Returns 404 for both 'not found' and 'belongs to another user' — fine for security (no enumeration), but worth noting it does not distinguish 403 vs 404. Behaviour is intentional & acceptable."
+      },
+      {
+        "endpoint": "global exception handler",
+        "issue": "`app.exception_handler(Exception)` returns `{detail: str(exc)}` to the client — risks leaking internal error messages/stack traces. Consider a generic message in production."
+      },
+      {
+        "endpoint": "/api/deals/{deal_id}/documents (POST)",
+        "issue": "No file-size cap. A malicious user could upload very large PDFs to /tmp/clearvault_uploads. Recommend MAX_PDF_BYTES check."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Update /app/memory/test_credentials.md to use a non-reserved domain (e.g. clearvault.io) OR relax EmailStr in SignupRequest/LoginRequest so `.test` works. Current docs and a fresh signup with the suggested creds will 422.",
+    "Tighten the generic exception handler to avoid leaking internal messages in production.",
+    "Add a max-upload-size guard on /api/deals/{id}/documents."
+  ],
+  "critical_code_review_comments": [
+    "models.BaseDocument.from_mongo returns None for empty doc but is typed as -> 'BaseDocument'; OK at runtime but type-misleading.",
+    "server._process_document logs exception but stores only str(exc)[:500]; fine, but the resulting status='failed' is silently visible only via GET /api/documents/{id} — frontend should handle the 'failed' state explicitly.",
+    "auth.JWT_SECRET has a 'dev-secret' fallback. The .env overrides it, but consider hard-failing in non-dev environments.",
+    "No pagination on /api/deals — could be slow for users with many deals. /api/activity/recent has a `limit` param but no offset.",
+    "/api/dashboard/stats iterates every completed document for the user in Python to count red flags — fine for MVP, would benefit from a precomputed counter when scale grows."
+  ],
+  "updated_files": [
+    "/app/backend/tests/backend_test.py"
+  ],
+  "success_rate": {
+    "backend": "100% (26/26)",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "Tests create fresh users per-run with random suffix at clearvault.io domain (e.g. analyst+<hex>@clearvault.io / Vault123!). The credentials in /app/memory/test_credentials.md (analyst@clearvault.test) DO NOT WORK due to pydantic EmailStr rejecting reserved .test TLD.",
+  "seed_data_creation": "Each test run creates 2 fresh users (USER_A, USER_B) with a uuid-suffixed email, 1 deal under USER_A, and 1 uploaded PDF (TEST_acme_financials.pdf). The deal+document are cleaned up at the end via the cascade-delete test. User documents remain in the `users` collection (test data is namespaced with random suffix).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Use /app/backend/tests/backend_test.py as the regression suite. It generates fresh users per-run (no fixtures across runs needed) and uses reportlab to build a tiny real PDF that Gemini can actually extract. The full AI extraction completes in ~10s against the deployed backend. If Gemini calls start failing, the test still passes as long as the doc reaches a terminal state ('failed') and prints the error — so always scan the captured stdout for `[WARN] AI extraction failed`. Public URL used: https://ui-build-showcase.preview.emergentagent.com.",
+  "rca of the issue": "Initial test run failed 22/26 because Pydantic v2 EmailStr rejects `*.test` per RFC2606 reserved TLDs. Fixed by switching test emails to `@clearvault.io`. The deployed code is fine, but the project's own test credentials documentation specifies an unusable address — flagged as a minor issue for main agent."
+}
