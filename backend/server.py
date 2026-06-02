@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from starlette.middleware.cors import CORSMiddleware
@@ -428,11 +428,12 @@ async def generate_rollup(deal_id: str, user_id: str = Depends(get_current_user_
         documents=docs_payload,
     )
 
+    ts = now_iso()
     await db.deals.update_one(
         {"_id": deal_id},
-        {"$set": {"rollup": rollup, "rollup_at": now_iso(), "updated_at": now_iso()}},
+        {"$set": {"rollup": rollup, "rollup_at": ts, "updated_at": ts}},
     )
-    return {"rollup": rollup, "rollup_at": now_iso()}
+    return {"rollup": rollup, "rollup_at": ts}
 
 
 @api.get("/deals/{deal_id}/rollup")
@@ -496,7 +497,11 @@ async def global_search(q: str = Query(""), user_id: str = Depends(get_current_u
 
 # ---------- Serve PDF file (iframe needs query token) ----------
 @api.get("/documents/{doc_id}/file")
-async def get_document_file(doc_id: str, token: Optional[str] = Query(None), authorization: Optional[str] = None):
+async def get_document_file(
+    doc_id: str,
+    token: Optional[str] = Query(None),
+    authorization: Optional[str] = Header(default=None),
+):
     # Accept either header bearer or ?token=
     user_id = None
     if token:
@@ -506,10 +511,13 @@ async def get_document_file(doc_id: str, token: Optional[str] = Query(None), aut
         except HTTPException:
             user_id = None
     if not user_id and authorization and authorization.lower().startswith("bearer "):
-        payload = decode_token(authorization.split(" ", 1)[1].strip())
-        user_id = payload.get("sub")
+        try:
+            payload = decode_token(authorization.split(" ", 1)[1].strip())
+            user_id = payload.get("sub")
+        except HTTPException:
+            user_id = None
     if not user_id:
-        raise HTTPException(status_code=401, detail="Missing token")
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
 
     raw = await db.documents.find_one({"_id": doc_id, "user_id": user_id})
     if not raw:
