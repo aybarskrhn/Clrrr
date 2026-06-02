@@ -13,6 +13,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, 
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel
+from pymongo import ReturnDocument
 from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
@@ -666,7 +667,11 @@ async def view_share(token: str):
     if not deal_raw.get("rollup"):
         raise HTTPException(status_code=410, detail="The IC memo has been removed")
 
-    await db.shares.update_one({"_id": token}, {"$inc": {"view_count": 1}})
+    updated = await db.shares.find_one_and_update(
+        {"_id": token},
+        {"$inc": {"view_count": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
     return {
         "deal": {
             "name": deal_raw.get("name"),
@@ -677,7 +682,7 @@ async def view_share(token: str):
         "rollup": deal_raw.get("rollup"),
         "rollup_at": deal_raw.get("rollup_at"),
         "shared_at": share.get("created_at"),
-        "view_count": (share.get("view_count") or 0) + 1,
+        "view_count": (updated or share).get("view_count", 1),
     }
 
 
