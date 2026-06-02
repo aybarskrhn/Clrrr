@@ -86,6 +86,8 @@ class Deal(BaseDocument):
     deal_size: Optional[str] = None  # e.g. "$45M"
     stage: str = "due_diligence"  # due_diligence | review | closed | flagged
     status: str = "active"
+    rollup: Optional[dict] = None
+    rollup_at: Optional[str] = None
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
 

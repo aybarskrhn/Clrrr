@@ -1,22 +1,24 @@
 """ClearVault — FastAPI backend."""
+import csv
+import io
 import logging
 import os
 import shutil
 import uuid
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-from ai_service import extract_pdf  # noqa: E402
-from auth import create_token, get_current_user_id, hash_password, verify_password  # noqa: E402
+from ai_service import extract_pdf, summarize_deal  # noqa: E402
+from auth import create_token, decode_token, get_current_user_id, hash_password, verify_password  # noqa: E402
 from models import (  # noqa: E402
     AuthResponse,
     Deal,
@@ -330,6 +332,196 @@ async def recent_activity(user_id: str = Depends(get_current_user_id), limit: in
             }
         )
     return items
+
+
+# ---------- CSV export ----------
+@api.get("/deals/{deal_id}/export.csv")
+async def export_deal_csv(deal_id: str, user_id: str = Depends(get_current_user_id)):
+    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    if not deal_raw:
+        raise HTTPException(status_code=404, detail="Deal not found")
+
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    deal = Deal.from_mongo(deal_raw)
+
+    writer.writerow([f"# ClearVault export — {deal.name} ({deal.target_company})"])
+    writer.writerow([f"# generated_at: {now_iso()}"])
+    writer.writerow([])
+
+    # Financial metrics section
+    writer.writerow(["section", "document", "label", "value", "period", "notes"])
+    async for raw in db.documents.find({"deal_id": deal_id, "status": "completed"}):
+        doc = Document.from_mongo(raw)
+        ex = doc.extracted or {}
+        for m in (ex.get("financial_metrics") or []):
+            writer.writerow([
+                "financial_metric",
+                doc.filename,
+                m.get("label", ""),
+                m.get("value", ""),
+                m.get("period", ""),
+                m.get("notes", ""),
+            ])
+
+    writer.writerow([])
+    writer.writerow(["section", "document", "severity", "title", "description", "page"])
+    async for raw in db.documents.find({"deal_id": deal_id, "status": "completed"}):
+        doc = Document.from_mongo(raw)
+        ex = doc.extracted or {}
+        for f in (ex.get("red_flags") or []):
+            writer.writerow([
+                "red_flag",
+                doc.filename,
+                f.get("severity", ""),
+                f.get("title", ""),
+                f.get("description", ""),
+                f.get("page", ""),
+            ])
+
+    writer.writerow([])
+    writer.writerow(["section", "document", "label", "value", "notes"])
+    async for raw in db.documents.find({"deal_id": deal_id, "status": "completed"}):
+        doc = Document.from_mongo(raw)
+        ex = doc.extracted or {}
+        for t in (ex.get("key_terms") or []):
+            writer.writerow([
+                "key_term",
+                doc.filename,
+                t.get("label", ""),
+                t.get("value", ""),
+                t.get("notes", ""),
+            ])
+
+    buf.seek(0)
+    safe = deal.name.replace(" ", "_").replace("/", "_")
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="clearvault_{safe}.csv"'},
+    )
+
+
+# ---------- Roll-up summary ----------
+@api.post("/deals/{deal_id}/rollup")
+async def generate_rollup(deal_id: str, user_id: str = Depends(get_current_user_id)):
+    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    if not deal_raw:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    deal = Deal.from_mongo(deal_raw)
+
+    completed = []
+    async for raw in db.documents.find({"deal_id": deal_id, "status": "completed"}):
+        completed.append(Document.from_mongo(raw))
+
+    if not completed:
+        raise HTTPException(status_code=400, detail="No completed extractions to roll up. Upload + process at least one PDF first.")
+
+    docs_payload = [
+        {"filename": d.filename, "extracted": d.extracted or {}}
+        for d in completed
+    ]
+    rollup = await summarize_deal(
+        deal_name=deal.name,
+        target_company=deal.target_company,
+        sector=deal.sector,
+        documents=docs_payload,
+    )
+
+    await db.deals.update_one(
+        {"_id": deal_id},
+        {"$set": {"rollup": rollup, "rollup_at": now_iso(), "updated_at": now_iso()}},
+    )
+    return {"rollup": rollup, "rollup_at": now_iso()}
+
+
+@api.get("/deals/{deal_id}/rollup")
+async def get_rollup(deal_id: str, user_id: str = Depends(get_current_user_id)):
+    raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    return {"rollup": raw.get("rollup"), "rollup_at": raw.get("rollup_at")}
+
+
+# ---------- Global search ----------
+@api.get("/search")
+async def global_search(q: str = Query(""), user_id: str = Depends(get_current_user_id)):
+    q = (q or "").strip()
+    results = {"deals": [], "documents": [], "red_flags": []}
+    if len(q) < 2:
+        return results
+
+    rx = {"$regex": q, "$options": "i"}
+
+    async for raw in db.deals.find(
+        {"user_id": user_id, "$or": [{"name": rx}, {"target_company": rx}, {"sector": rx}]}
+    ).limit(8):
+        results["deals"].append({
+            "id": str(raw["_id"]),
+            "name": raw.get("name"),
+            "target_company": raw.get("target_company"),
+            "sector": raw.get("sector"),
+        })
+
+    async for raw in db.documents.find({"user_id": user_id, "filename": rx}).limit(8):
+        results["documents"].append({
+            "id": str(raw["_id"]),
+            "deal_id": raw.get("deal_id"),
+            "filename": raw.get("filename"),
+            "status": raw.get("status"),
+        })
+
+    # red flag search: scan extracted titles
+    q_lower = q.lower()
+    flags_found = 0
+    async for raw in db.documents.find({"user_id": user_id, "status": "completed"}):
+        if flags_found >= 8:
+            break
+        for f in (raw.get("extracted") or {}).get("red_flags", []):
+            if q_lower in (f.get("title") or "").lower() or q_lower in (f.get("description") or "").lower():
+                results["red_flags"].append({
+                    "document_id": str(raw["_id"]),
+                    "deal_id": raw.get("deal_id"),
+                    "filename": raw.get("filename"),
+                    "severity": f.get("severity"),
+                    "title": f.get("title"),
+                    "page": f.get("page"),
+                })
+                flags_found += 1
+                if flags_found >= 8:
+                    break
+
+    return results
+
+
+# ---------- Serve PDF file (iframe needs query token) ----------
+@api.get("/documents/{doc_id}/file")
+async def get_document_file(doc_id: str, token: Optional[str] = Query(None), authorization: Optional[str] = None):
+    # Accept either header bearer or ?token=
+    user_id = None
+    if token:
+        try:
+            payload = decode_token(token)
+            user_id = payload.get("sub")
+        except HTTPException:
+            user_id = None
+    if not user_id and authorization and authorization.lower().startswith("bearer "):
+        payload = decode_token(authorization.split(" ", 1)[1].strip())
+        user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Missing token")
+
+    raw = await db.documents.find_one({"_id": doc_id, "user_id": user_id})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Document not found")
+    path = Path(raw["file_path"])
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="File missing on disk")
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{raw.get("filename","document.pdf")}"'},
+    )
 
 
 # ---------- Exception passthrough ----------

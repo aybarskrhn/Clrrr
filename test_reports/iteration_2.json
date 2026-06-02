@@ -1,0 +1,57 @@
+{
+  "summary": "Tested the 4 new ClearVault features (CSV export, multi-doc roll-up via Gemini, global search, PDF file endpoint) plus light regression. 32/34 new tests pass against the public preview URL. Two failures point to ONE real backend bug: header-based Bearer auth does not work on /api/documents/{id}/file because the FastAPI parameter is missing the Header(...) annotation. Query-token auth, CSV export, roll-up generation/caching, cross-user 404, and global search all work correctly. Existing 26-test backend suite continues to pass.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "GET /api/documents/{doc_id}/file",
+        "issue": "Header-based auth (Authorization: Bearer ...) does NOT work — server returns 401 'Missing token'. Root cause: in server.py line 499, the signature is `authorization: Optional[str] = None` without `Header(None)`. FastAPI therefore treats `authorization` as a query parameter, not an HTTP header, so the inbound header is never read. The query `?token=` path works; only header auth is broken. The review request explicitly says: 'Header-based auth (Authorization: Bearer ...) should ALSO work.' Fix: `from fastapi import Header` and change to `authorization: Optional[str] = Header(default=None)`.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/deals/{id}/rollup",
+        "issue": "Response `rollup_at` is recomputed with a second `now_iso()` call AFTER the DB write, so the value returned to the client differs from the value persisted in MongoDB by a few microseconds. Subsequent GET /rollup returns the persisted (earlier) value. Cosmetic but inconsistent — recommend computing `now_iso()` once into a variable and using it for both the `$set` and the response."
+      },
+      {
+        "endpoint": "GET /api/documents/{doc_id}/file",
+        "issue": "When `?token=` is invalid/expired, `decode_token` raises HTTPException which is caught and `user_id` set to None — that yields 401 'Missing token' (correct status, slightly misleading detail). When using `Authorization` header (once fixed), decode failure is NOT caught and will bubble up as 401 with a different detail. Behaviour around invalid bearer header should be made consistent with the query-token path."
+      },
+      {
+        "endpoint": "GET /api/search",
+        "issue": "Returns empty arrays for q<2 chars — correct per spec. Red-flag scan iterates ALL completed documents in Python per query; for users with hundreds of completed docs this can get slow. Consider indexing or capping the documents scanned. Not blocking for MVP."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_new_features.xml"
+  ],
+  "action_items": [
+    "Fix /api/documents/{doc_id}/file header auth — add `Header()` annotation to `authorization` parameter (one-line fix in server.py). Without this, the frontend's iframe PDF preview will work (uses ?token=) but any client that uses Authorization header will get 401.",
+    "Single-source `now_iso()` in POST /api/deals/{id}/rollup so response and DB agree on `rollup_at`.",
+    "(Optional) Make invalid-header vs invalid-?token= error responses consistent on /documents/{id}/file."
+  ],
+  "critical_code_review_comments": [
+    "server.py line 499: `authorization: Optional[str] = None` is a FastAPI footgun — without `Header(...)` it becomes a QUERY parameter. This is the root cause of the failing header-auth contract.",
+    "server.py lines 432-435: `now_iso()` called twice in rollup POST; response uses the second call while DB stores the first, producing micro-second drift between cached and returned timestamps.",
+    "server.py global_search() loops over every completed doc per request (no index on red_flag titles); fine for MVP but flag for scale.",
+    "server.py export_deal_csv() runs THREE separate find() cursors over `db.documents` for the same deal — could be one query with a per-doc loop in Python; trivial optimization.",
+    "ai_service.summarize_deal not reviewed in detail but its output shape (executive_summary/recommendation/top_red_flags/consolidated_financials/diligence_gaps/next_steps) is correct against the spec — generation takes ~10–20s in practice, well under the 90s test timeout."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py"
+  ],
+  "success_rate": {
+    "backend": "94% (32/34 new feature tests); 100% on existing regression suite",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "Fresh users per-run: newfeat_a+<hex>@clearvault.io / Vault123! and newfeat_b+<hex>@clearvault.io / Vault123!. Docs still suggest analyst@clearvault.io but signup creates a new uuid-suffixed user every run, so no collision.",
+  "seed_data_creation": "Per-run: 2 users, 2 deals (one each), 1 uploaded PDF under user A (TEST_zephyr_financials.pdf with red-flag triggers: customer concentration, off-balance leases, going-concern, material weakness). All test data cleaned up in TestCleanup via cascade delete.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Two test files now: /app/backend/tests/backend_test.py (26 tests, existing regression) and /app/backend/tests/test_new_features.py (34 tests for the 4 new features). Run both together with `pytest /app/backend/tests/ -v`. The PDF endpoint header-auth tests WILL fail until the main agent adds `Header()` annotation to the `authorization` param in server.py line 499. After that fix, expect 34/34 on the new suite. reportlab had to be pip-installed in the test env (was not on requirements); it is now installed.",
+  "rca of the issue": "Two PDF-file-endpoint tests fail because server.py defines `async def get_document_file(doc_id: str, token: Optional[str] = Query(None), authorization: Optional[str] = None)`. FastAPI's parameter resolution treats `authorization` (a plain typed parameter without Path/Query/Header/Body) as a query parameter — so the Authorization HTTP header is silently ignored. Reproduction: `curl -H 'Authorization: Bearer <valid-jwt>' <preview>/api/documents/<id>/file` returns 401 'Missing token' instead of the PDF. Mitigation (one-line fix): `from fastapi import Header` (already imported) and change signature to `authorization: Optional[str] = Header(default=None)`. The rest of the contract (query token, cross-user 404, content-type application/pdf, body starts with %PDF-, valid PDF size) all pass."
+}

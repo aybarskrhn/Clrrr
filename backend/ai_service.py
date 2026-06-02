@@ -99,3 +99,74 @@ async def extract_pdf(file_path: str, model: str = "gemini-2.5-flash") -> Dict[s
     data.setdefault("parties", [])
     data.setdefault("confidence", 0.8)
     return data
+
+
+ROLLUP_SYSTEM_PROMPT = """You are a senior M&A managing director writing an IC (investment committee) \
+roll-up memo across multiple due diligence documents for a single deal. \
+You will be given the extracted JSON from each document. Synthesize them.
+
+Respond with ONLY valid JSON. No markdown, no commentary.
+
+Schema:
+{
+  "executive_summary": "3-5 sentence summary suitable for the top of an IC memo",
+  "recommendation": "proceed | proceed_with_caution | pass",
+  "recommendation_rationale": "1-2 sentence justification",
+  "consolidated_financials": [
+    {"label": "Revenue", "value": "$42.3M", "period": "FY2024", "source": "audit_report.pdf"}
+  ],
+  "top_red_flags": [
+    {"severity": "high|medium|low", "title": "short title", "description": "1 sentence", "source": "audit_report.pdf"}
+  ],
+  "diligence_gaps": ["What documents or data we still need"],
+  "next_steps": ["Specific analyst action items"]
+}
+
+Rules:
+- top_red_flags: at most 7, ranked by severity then importance
+- consolidated_financials: dedupe across documents, prefer the most recent period
+- Be terse. This is for senior partners. Numbers, not adjectives.
+"""
+
+
+async def summarize_deal(deal_name: str, target_company: str, sector: str, documents: list, model: str = "gemini-2.5-flash") -> dict:
+    """Produce a roll-up across multiple extracted documents."""
+    if not EMERGENT_LLM_KEY:
+        raise RuntimeError("EMERGENT_LLM_KEY is not configured")
+
+    chat = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=f"rollup-{uuid.uuid4()}",
+        system_message=ROLLUP_SYSTEM_PROMPT,
+    ).with_model("gemini", model)
+
+    payload = {
+        "deal_name": deal_name,
+        "target_company": target_company,
+        "sector": sector,
+        "documents": documents,
+    }
+    text = (
+        "Synthesize an IC roll-up across these extracted M&A documents. Respond JSON only.\n\n"
+        + json.dumps(payload, indent=2)[:60000]  # cap to keep request size reasonable
+    )
+
+    raw = await chat.send_message(UserMessage(text=text))
+    logger.info("Rollup raw length=%s", len(raw or ""))
+    cleaned = _strip_json(raw)
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", cleaned)
+        if not match:
+            raise
+        data = json.loads(match.group(0))
+
+    data.setdefault("executive_summary", "")
+    data.setdefault("recommendation", "proceed_with_caution")
+    data.setdefault("recommendation_rationale", "")
+    data.setdefault("consolidated_financials", [])
+    data.setdefault("top_red_flags", [])
+    data.setdefault("diligence_gaps", [])
+    data.setdefault("next_steps", [])
+    return data
