@@ -40,6 +40,7 @@ db = client[os.environ["DB_NAME"]]
 
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/clearvault_uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
 
 app = FastAPI(title="ClearVault API")
 api = APIRouter(prefix="/api")
@@ -335,7 +336,7 @@ async def recent_activity(user_id: str = Depends(get_current_user_id), limit: in
 @app.exception_handler(Exception)
 async def unhandled(_, exc):  # noqa: ANN001
     logger.exception("Unhandled error: %s", exc)
-    return JSONResponse(status_code=500, content={"detail": str(exc)})
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 app.include_router(api)
