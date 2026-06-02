@@ -1,0 +1,61 @@
+{
+  "summary": "Tested 3 new ClearVault feature areas (Stripe Checkout, Public IC-memo share, Settings/Slack webhook) plus full regression. 40/40 new tests PASS; 60/60 existing regression tests (backend_test.py + test_new_features.py) continue to PASS. Total 100/100. All review-requested behaviours verified against the live preview backend, including real Stripe test-mode session creation (cs_test_... URL), public unauthenticated share viewing with view_count increment, idempotent share creation, cross-user 404 isolation, Slack URL allowlist (rejects non-hooks.slack.com with 400, empty string clears), and webhook 400-not-500 smoke. The header-auth bug from iteration 2 is confirmed FIXED.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "GET /api/payments/checkout/status/{session_id}",
+        "issue": "amount_total is returned as None for sessions that have not yet been paid (Stripe returns null until checkout completes). Test still passes because the key exists, but if the frontend reads it blindly it may render `null`. Minor — guard on the client or coerce to 0 server-side."
+      },
+      {
+        "endpoint": "POST /api/payments/checkout/session",
+        "issue": "payment_transactions document is keyed by Stripe's session_id as `_id`; if Stripe ever returns a non-unique cs_test_ id (extremely unlikely) the insert would 500. Cosmetic — not worth changing."
+      },
+      {
+        "endpoint": "POST /api/webhook/stripe",
+        "issue": "Endpoint correctly returns 400 for unsigned/empty bodies (does NOT crash). Could not validate the happy-path because we are not faking valid Stripe signatures — recommend an integration test using Stripe CLI for full coverage."
+      },
+      {
+        "endpoint": "GET /api/share/{token}",
+        "issue": "view_count returned is `(persisted+1)` rather than the freshly persisted value because the code uses $inc and then adds 1 in Python instead of re-reading the doc. Still monotonically increasing and matches the next GET, so tests pass — but two concurrent viewers could see the same count. Minor."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_billing_share_slack.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/test_reports/pytest/pytest_billing_share_slack.xml"
+  ],
+  "action_items": [
+    "(Optional) Coerce amount_total to 0 on the server when Stripe returns null for unpaid sessions, so the frontend can format it safely.",
+    "(Optional) Re-read share doc after $inc to return the canonical view_count instead of computing it client-side as persisted+1.",
+    "(Optional) Add a happy-path Stripe webhook integration test using Stripe CLI in CI."
+  ],
+  "critical_code_review_comments": [
+    "server.py:602 _gen_share_token uses uuid4().hex + first 8 of another uuid4 → 40 chars, ~160 bits entropy. Good. No collision risk in practice.",
+    "server.py:680 view_count returned to the public viewer is `(share.get('view_count') or 0) + 1` rather than the post-$inc value from Mongo. Use find_one_and_update with return_document=AFTER for canonical reads.",
+    "server.py:709 host_url = str(request.base_url) — behind the K8s ingress this resolves to the internal scheme/host. StripeCheckout webhook_url therefore points at the internal address rather than the public preview URL. Webhooks from real Stripe would fail to reach the server. For test-mode session creation it does not matter (Stripe accepts any webhook URL on session create), but in production this needs PUBLIC_APP_URL or a request.headers['x-forwarded-host'] fallback.",
+    "payments.py:31 STRIPE_API_KEY falls back to literal 'sk_test_emergent' if env var missing — fine for this env, but in production should fail-fast instead of using a placeholder.",
+    "slack_notify.py correctly guards against non-hooks.slack.com URLs at notify time AND at PATCH /auth/settings time → defense in depth. Good.",
+    "server.py:654 revoke_share uses `update_many` on {deal_id, user_id} — correct, cascades to all active shares for that owner. Cross-user revoke correctly 404s because the deal lookup is scoped to user_id first.",
+    "server.py:613 idempotent share lookup uses {revoked: {$ne: True}} — works whether the field is missing or False. Good.",
+    "server.py:660 view_share intentionally has NO auth dependency — verified by tests (200 with no Authorization header). This is the design.",
+    "models.py User defaults plan='trial' and slack_webhook_url=None — matches signup response shape verified in tests.",
+    "Recommend adding a TTL or expiry mechanism to shares (currently shares live forever until manually revoked). Out of scope for this iteration but worth flagging."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_billing_share_slack.py (new — 40 tests across 9 classes)"
+  ],
+  "success_rate": {
+    "backend": "100% (40/40 new + 60/60 regression = 100/100)",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "Fresh per-run users: billshare_a+<hex>@clearvault.io / Vault123! and billshare_b+<hex>@clearvault.io / Vault123!. All deleted at end of run.",
+  "seed_data_creation": "Per-run: 2 users, 2 deals (one each), 1 uploaded PDF under user A (TEST_share_zephyr.pdf), 1 AI extraction, 1 rollup, 1 share token (revoked then re-created). All cleaned up by TestCleanup.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Three pytest files now cover the backend: backend_test.py (baseline 26 tests), test_new_features.py (CSV/rollup/search/PDF file — 34 tests), test_billing_share_slack.py (Stripe checkout/share/settings — 40 tests). Run all with `REACT_APP_BACKEND_URL=https://ui-build-showcase.preview.emergentagent.com pytest /app/backend/tests/ -v`. NOTE: REACT_APP_BACKEND_URL must be exported in the shell — the test file deliberately uses os.environ[] (no default) per environment rules. The review-request URL (f7b5d136-...) did not match the actual /app/frontend/.env value (ui-build-showcase...); used the .env value as the source of truth per protected-variable instructions. Stripe runs in real test mode — cs_test_* session ids are minted against live Stripe. Webhooks were not exercised on the happy path (no signature faking).",
+  "rca of the issue": "No regression. The previously-flagged Header() annotation bug on /api/documents/{id}/file is confirmed fixed (test_header_bearer_returns_pdf passes). All new endpoints behave per the review spec."
+}

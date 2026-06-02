@@ -17,6 +17,9 @@ import {
   Sparkles,
   FileSearch,
   LayoutGrid,
+  Share2,
+  Copy,
+  X,
 } from "lucide-react";
 
 function StatusChip({ status }) {
@@ -296,6 +299,7 @@ export default function DealDetail() {
 
         {tab === "rollup" && (
           <RollupTab
+            dealId={id}
             rollup={rollup}
             rollupAt={rollupAt}
             onGenerate={generateRollup}
@@ -635,7 +639,54 @@ function PreviewTab({ docs, selected, setSelected, ex }) {
 }
 
 /* ---------- IC roll-up tab ---------- */
-function RollupTab({ rollup, rollupAt, onGenerate, loading, completedCount }) {
+function RollupTab({ dealId, rollup, rollupAt, onGenerate, loading, completedCount }) {
+  const [share, setShare] = useState(null);
+  const [shareLoading, setShareLoading] = useState(false);
+
+  useEffect(() => {
+    if (!rollup) return;
+    api.get(`/deals/${dealId}/share`).then(({ data }) => setShare(data?.token ? data : null));
+  }, [dealId, rollup]);
+
+  const createShare = async () => {
+    setShareLoading(true);
+    try {
+      const { data } = await api.post(`/deals/${dealId}/share`);
+      setShare(data);
+      toast.success("Share link created.");
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Share failed");
+    } finally {
+      setShareLoading(false);
+    }
+  };
+
+  const revokeShare = async () => {
+    if (!window.confirm("Revoke this link? Anyone holding it will lose access immediately.")) return;
+    setShareLoading(true);
+    try {
+      await api.delete(`/deals/${dealId}/share`);
+      setShare(null);
+      toast.success("Share link revoked.");
+    } catch (err) {
+      toast.error("Revoke failed");
+    } finally {
+      setShareLoading(false);
+    }
+  };
+
+  const shareUrl = share ? `${window.location.origin}/share/${share.token}` : null;
+
+  const copyUrl = async () => {
+    if (!shareUrl) return;
+    try {
+      await navigator.clipboard.writeText(shareUrl);
+      toast.success("Link copied.");
+    } catch (e) {
+      toast.error("Couldn't copy — select and copy manually.");
+    }
+  };
+
   const recColor = (r) => {
     if (r === "proceed") return "cv-chip-green";
     if (r === "pass") return "cv-chip-red";
@@ -660,20 +711,70 @@ function RollupTab({ rollup, rollupAt, onGenerate, loading, completedCount }) {
             )}
           </p>
         </div>
-        <button
-          onClick={onGenerate}
-          disabled={loading || completedCount === 0}
-          data-testid="deal-generate-rollup-btn"
-          className="flex items-center gap-2 bg-[var(--cv-primary)] px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-widest text-black hover:bg-[var(--cv-primary-hover)] disabled:opacity-50"
-        >
-          {loading ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Sparkles className="h-3.5 w-3.5" />
+        <div className="flex items-center gap-2">
+          {rollup && !share && (
+            <button
+              onClick={createShare}
+              disabled={shareLoading}
+              data-testid="deal-share-btn"
+              className="flex items-center gap-2 border border-[var(--cv-border)] px-3 py-2.5 font-mono text-xs uppercase tracking-widest text-[var(--cv-muted)] hover:border-[var(--cv-primary)] hover:text-[var(--cv-primary)] disabled:opacity-60"
+            >
+              {shareLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Share2 className="h-3.5 w-3.5" />}
+              Share
+            </button>
           )}
-          {rollup ? "Regenerate" : "Generate roll-up"}
-        </button>
+          <button
+            onClick={onGenerate}
+            disabled={loading || completedCount === 0}
+            data-testid="deal-generate-rollup-btn"
+            className="flex items-center gap-2 bg-[var(--cv-primary)] px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-widest text-black hover:bg-[var(--cv-primary-hover)] disabled:opacity-50"
+          >
+            {loading ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5" />
+            )}
+            {rollup ? "Regenerate" : "Generate roll-up"}
+          </button>
+        </div>
       </div>
+
+      {/* Active share link banner */}
+      {share && (
+        <div
+          data-testid="deal-share-banner"
+          className="flex flex-wrap items-center gap-3 border border-[var(--cv-primary)]/70 bg-[var(--cv-surface)] px-4 py-3"
+        >
+          <Share2 className="h-3.5 w-3.5 text-[var(--cv-primary)]" />
+          <span className="font-mono text-[11px] uppercase tracking-widest text-[var(--cv-primary)]">
+            Public link active
+          </span>
+          <input
+            readOnly
+            value={shareUrl || ""}
+            data-testid="deal-share-url"
+            className="flex-1 min-w-[280px] border border-[var(--cv-border)] bg-[var(--cv-bg)] px-3 py-1.5 font-mono text-[11px] text-[var(--cv-text)] outline-none"
+            onFocus={(e) => e.target.select()}
+          />
+          <button
+            onClick={copyUrl}
+            data-testid="deal-share-copy"
+            className="flex items-center gap-1 border border-[var(--cv-border)] px-3 py-1.5 font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)] hover:border-[var(--cv-primary)] hover:text-[var(--cv-primary)]"
+          >
+            <Copy className="h-3 w-3" /> copy
+          </button>
+          <button
+            onClick={revokeShare}
+            data-testid="deal-share-revoke"
+            className="flex items-center gap-1 border border-[var(--cv-border)] px-3 py-1.5 font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)] hover:border-[var(--cv-danger)] hover:text-[var(--cv-danger)]"
+          >
+            <X className="h-3 w-3" /> revoke
+          </button>
+          <span className="font-mono text-[10px] text-[var(--cv-muted)]">
+            {share.view_count} view{share.view_count === 1 ? "" : "s"}
+          </span>
+        </div>
+      )}
 
       {!rollup && !loading && (
         <div className="border border-dashed border-[var(--cv-border)] bg-[var(--cv-surface)] px-6 py-16 text-center font-mono text-xs text-[var(--cv-muted)]">

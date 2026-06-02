@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { Link, useNavigate } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
+import api from "@/lib/api";
 import { AUTH, NAV } from "@/constants/testIds";
 import { toast } from "sonner";
 import { ArrowRight, Loader2 } from "lucide-react";
@@ -8,6 +9,8 @@ import { ArrowRight, Loader2 } from "lucide-react";
 export default function Signup() {
   const { signup } = useAuth();
   const navigate = useNavigate();
+  const [params] = useSearchParams();
+  const next = params.get("next");
   const [form, setForm] = useState({ name: "", firm: "", email: "", password: "" });
   const [loading, setLoading] = useState(false);
 
@@ -19,6 +22,18 @@ export default function Signup() {
     try {
       await signup(form);
       toast.success("Terminal provisioned.");
+      if (next === "upgrade") {
+        try {
+          const { data } = await api.post("/payments/checkout/session", {
+            package_id: "desk_monthly",
+            origin_url: window.location.origin,
+          });
+          window.location.href = data.url;
+          return;
+        } catch (err) {
+          toast.error("Couldn't redirect to checkout — open Settings to try again.");
+        }
+      }
       navigate("/dashboard");
     } catch (err) {
       toast.error(err?.response?.data?.detail || "Signup failed");

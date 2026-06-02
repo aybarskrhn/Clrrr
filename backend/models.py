@@ -48,6 +48,9 @@ class User(BaseDocument):
     password_hash: str
     firm: Optional[str] = None
     role: str = "analyst"
+    plan: str = "trial"  # trial | desk | firm
+    plan_active_until: Optional[str] = None
+    slack_webhook_url: Optional[str] = None
     created_at: str = Field(default_factory=now_iso)
 
 
@@ -57,6 +60,9 @@ class UserPublic(BaseModel):
     name: str
     firm: Optional[str] = None
     role: str
+    plan: str = "trial"
+    plan_active_until: Optional[str] = None
+    slack_webhook_url: Optional[str] = None
     created_at: str
 
 

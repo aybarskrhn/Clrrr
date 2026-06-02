@@ -9,9 +9,10 @@ from pathlib import Path
 from typing import List, Optional
 
 from dotenv import load_dotenv
-from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
@@ -19,6 +20,9 @@ load_dotenv(ROOT_DIR / ".env")
 
 from ai_service import extract_pdf, summarize_deal  # noqa: E402
 from auth import create_token, decode_token, get_current_user_id, hash_password, verify_password  # noqa: E402
+from emergentintegrations.payments.stripe.checkout import CheckoutSessionRequest  # noqa: E402
+from payments import PACKAGES, get_package, make_checkout  # noqa: E402
+from slack_notify import notify_extraction_complete  # noqa: E402
 from models import (  # noqa: E402
     AuthResponse,
     Deal,
@@ -56,6 +60,9 @@ def user_public(user: User) -> UserPublic:
         name=user.name,
         firm=user.firm,
         role=user.role,
+        plan=user.plan,
+        plan_active_until=user.plan_active_until,
+        slack_webhook_url=user.slack_webhook_url,
         created_at=user.created_at,
     )
 
@@ -237,6 +244,28 @@ async def _process_document(document_id: str):
             {"$set": {"status": "completed", "extracted": extracted, "processed_at": now_iso()}},
         )
         logger.info("Document %s extraction complete", document_id)
+
+        # Slack notification (best-effort)
+        try:
+            user_raw = await db.users.find_one({"_id": doc.user_id})
+            deal_raw = await db.deals.find_one({"_id": doc.deal_id})
+            if user_raw and user_raw.get("slack_webhook_url") and deal_raw:
+                red = extracted.get("red_flags") or []
+                high = sum(1 for f in red if (f.get("severity") or "").lower() == "high")
+                await notify_extraction_complete(
+                    user_raw.get("slack_webhook_url"),
+                    deal_name=deal_raw.get("name", ""),
+                    target_company=deal_raw.get("target_company", ""),
+                    filename=doc.filename,
+                    summary=extracted.get("summary", "") or "",
+                    red_flags=red,
+                    high_count=high,
+                    app_url=os.environ.get("PUBLIC_APP_URL"),
+                    deal_id=doc.deal_id,
+                )
+        except Exception as nexc:  # noqa: BLE001
+            logger.warning("Slack notify skipped: %s", nexc)
+
     except Exception as exc:  # noqa: BLE001
         logger.exception("Extraction failed for %s", document_id)
         await db.documents.update_one(
@@ -537,6 +566,264 @@ async def get_document_file(
 async def unhandled(_, exc):  # noqa: ANN001
     logger.exception("Unhandled error: %s", exc)
     return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+# =============================================================
+# Settings (Slack webhook etc.)
+# =============================================================
+class SettingsUpdate(BaseModel):
+    slack_webhook_url: Optional[str] = None
+    firm: Optional[str] = None
+    name: Optional[str] = None
+
+
+@api.patch("/auth/settings", response_model=UserPublic)
+async def update_settings(payload: SettingsUpdate, user_id: str = Depends(get_current_user_id)):
+    update: dict = {}
+    if payload.slack_webhook_url is not None:
+        url = payload.slack_webhook_url.strip()
+        if url and not url.startswith("https://hooks.slack.com/"):
+            raise HTTPException(status_code=400, detail="slack_webhook_url must start with https://hooks.slack.com/")
+        update["slack_webhook_url"] = url or None
+    if payload.firm is not None:
+        update["firm"] = payload.firm.strip() or None
+    if payload.name is not None and payload.name.strip():
+        update["name"] = payload.name.strip()
+    if update:
+        await db.users.update_one({"_id": user_id}, {"$set": update})
+    user = await _find_user_by_id(user_id)
+    return user_public(user)
+
+
+# =============================================================
+# Public share — read-only IC memo link
+# =============================================================
+def _gen_share_token() -> str:
+    return uuid.uuid4().hex + uuid.uuid4().hex[:8]  # 40 chars
+
+
+@api.post("/deals/{deal_id}/share")
+async def create_share(deal_id: str, user_id: str = Depends(get_current_user_id)):
+    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    if not deal_raw:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    if not deal_raw.get("rollup"):
+        raise HTTPException(status_code=400, detail="Generate the IC roll-up before sharing.")
+
+    existing = await db.shares.find_one({"deal_id": deal_id, "revoked": {"$ne": True}})
+    if existing:
+        return {
+            "token": existing["_id"],
+            "url_path": f"/share/{existing['_id']}",
+            "created_at": existing.get("created_at"),
+            "view_count": existing.get("view_count", 0),
+        }
+
+    token = _gen_share_token()
+    await db.shares.insert_one(
+        {
+            "_id": token,
+            "deal_id": deal_id,
+            "user_id": user_id,
+            "created_at": now_iso(),
+            "view_count": 0,
+            "revoked": False,
+        }
+    )
+    return {"token": token, "url_path": f"/share/{token}", "created_at": now_iso(), "view_count": 0}
+
+
+@api.get("/deals/{deal_id}/share")
+async def get_share(deal_id: str, user_id: str = Depends(get_current_user_id)):
+    existing = await db.shares.find_one({"deal_id": deal_id, "user_id": user_id, "revoked": {"$ne": True}})
+    if not existing:
+        return {"token": None}
+    return {
+        "token": existing["_id"],
+        "url_path": f"/share/{existing['_id']}",
+        "created_at": existing.get("created_at"),
+        "view_count": existing.get("view_count", 0),
+    }
+
+
+@api.delete("/deals/{deal_id}/share")
+async def revoke_share(deal_id: str, user_id: str = Depends(get_current_user_id)):
+    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    if not deal_raw:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    await db.shares.update_many({"deal_id": deal_id, "user_id": user_id}, {"$set": {"revoked": True}})
+    return {"revoked": True}
+
+
+@api.get("/share/{token}")
+async def view_share(token: str):
+    share = await db.shares.find_one({"_id": token, "revoked": {"$ne": True}})
+    if not share:
+        raise HTTPException(status_code=404, detail="Share link not found or revoked")
+    deal_raw = await db.deals.find_one({"_id": share["deal_id"]})
+    if not deal_raw:
+        raise HTTPException(status_code=404, detail="Deal no longer exists")
+    if not deal_raw.get("rollup"):
+        raise HTTPException(status_code=410, detail="The IC memo has been removed")
+
+    await db.shares.update_one({"_id": token}, {"$inc": {"view_count": 1}})
+    return {
+        "deal": {
+            "name": deal_raw.get("name"),
+            "target_company": deal_raw.get("target_company"),
+            "sector": deal_raw.get("sector"),
+            "deal_size": deal_raw.get("deal_size"),
+        },
+        "rollup": deal_raw.get("rollup"),
+        "rollup_at": deal_raw.get("rollup_at"),
+        "shared_at": share.get("created_at"),
+        "view_count": (share.get("view_count") or 0) + 1,
+    }
+
+
+# =============================================================
+# Stripe Checkout
+# =============================================================
+class CheckoutCreateRequest(BaseModel):
+    package_id: str
+    origin_url: str
+
+
+@api.get("/payments/packages")
+async def list_packages():
+    return {
+        "packages": [
+            {"id": pid, "amount": p["amount"], "currency": p["currency"], "label": p["label"], "plan": p["plan"]}
+            for pid, p in PACKAGES.items()
+        ]
+    }
+
+
+@api.post("/payments/checkout/session")
+async def create_checkout_session(payload: CheckoutCreateRequest, request: Request, user_id: str = Depends(get_current_user_id)):
+    pkg = get_package(payload.package_id)
+    if not pkg:
+        raise HTTPException(status_code=400, detail="Unknown package")
+
+    origin = payload.origin_url.rstrip("/")
+    host_url = str(request.base_url)
+    stripe = make_checkout(host_url)
+
+    success_url = f"{origin}/billing/success?session_id={{CHECKOUT_SESSION_ID}}"
+    cancel_url = f"{origin}/billing/cancel"
+
+    metadata = {"user_id": user_id, "package_id": payload.package_id, "plan": pkg["plan"]}
+    req = CheckoutSessionRequest(
+        amount=pkg["amount"],
+        currency=pkg["currency"],
+        success_url=success_url,
+        cancel_url=cancel_url,
+        metadata=metadata,
+    )
+    session = await stripe.create_checkout_session(req)
+
+    await db.payment_transactions.insert_one(
+        {
+            "_id": session.session_id,
+            "user_id": user_id,
+            "package_id": payload.package_id,
+            "plan": pkg["plan"],
+            "amount": pkg["amount"],
+            "currency": pkg["currency"],
+            "metadata": metadata,
+            "payment_status": "initiated",
+            "status": "open",
+            "created_at": now_iso(),
+            "updated_at": now_iso(),
+        }
+    )
+    return {"url": session.url, "session_id": session.session_id}
+
+
+@api.get("/payments/checkout/status/{session_id}")
+async def checkout_status(session_id: str, request: Request, user_id: str = Depends(get_current_user_id)):
+    txn = await db.payment_transactions.find_one({"_id": session_id})
+    if not txn or txn.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+
+    # If we already finalized, return the persisted record (idempotent)
+    if txn.get("payment_status") == "paid":
+        return {
+            "session_id": session_id,
+            "status": txn.get("status"),
+            "payment_status": txn.get("payment_status"),
+            "amount_total": int(txn.get("amount", 0) * 100),
+            "currency": txn.get("currency", "usd"),
+            "plan": txn.get("plan"),
+            "already_processed": True,
+        }
+
+    stripe = make_checkout(str(request.base_url))
+    status_resp = await stripe.get_checkout_status(session_id)
+
+    new_payment_status = status_resp.payment_status
+    new_status = status_resp.status
+
+    update = {"payment_status": new_payment_status, "status": new_status, "updated_at": now_iso()}
+
+    if new_payment_status == "paid" and txn.get("payment_status") != "paid":
+        # First time we see it paid — upgrade user plan
+        update["paid_at"] = now_iso()
+        await db.users.update_one(
+            {"_id": user_id},
+            {"$set": {"plan": txn.get("plan", "desk"), "plan_active_until": _plan_end(txn.get("package_id"))}},
+        )
+
+    await db.payment_transactions.update_one({"_id": session_id}, {"$set": update})
+
+    return {
+        "session_id": session_id,
+        "status": new_status,
+        "payment_status": new_payment_status,
+        "amount_total": status_resp.amount_total,
+        "currency": status_resp.currency,
+        "plan": txn.get("plan"),
+        "already_processed": False,
+    }
+
+
+def _plan_end(package_id: Optional[str]) -> str:
+    """Return ISO string for plan expiry — monthly = +30d, annual = +365d."""
+    from datetime import datetime, timedelta, timezone
+    days = 365 if (package_id or "").endswith("annual") else 30
+    return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
+
+
+@api.post("/webhook/stripe")
+async def stripe_webhook(request: Request):
+    body = await request.body()
+    sig = request.headers.get("Stripe-Signature", "")
+    stripe = make_checkout(str(request.base_url))
+    try:
+        evt = await stripe.handle_webhook(body, sig)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Stripe webhook verify failed: %s", exc)
+        raise HTTPException(status_code=400, detail="Invalid webhook")
+
+    session_id = getattr(evt, "session_id", None)
+    payment_status = getattr(evt, "payment_status", None)
+    if not session_id:
+        return {"ok": True}
+
+    txn = await db.payment_transactions.find_one({"_id": session_id})
+    if not txn:
+        return {"ok": True}
+
+    if payment_status == "paid" and txn.get("payment_status") != "paid":
+        await db.payment_transactions.update_one(
+            {"_id": session_id},
+            {"$set": {"payment_status": "paid", "status": "complete", "paid_at": now_iso(), "updated_at": now_iso()}},
+        )
+        await db.users.update_one(
+            {"_id": txn["user_id"]},
+            {"$set": {"plan": txn.get("plan", "desk"), "plan_active_until": _plan_end(txn.get("package_id"))}},
+        )
+    return {"ok": True}
 
 
 app.include_router(api)

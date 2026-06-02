@@ -1,5 +1,8 @@
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
+import api from "@/lib/api";
+import { useAuth } from "@/context/AuthContext";
+import { toast } from "sonner";
 import {
   ArrowRight,
   ShieldCheck,
@@ -89,6 +92,33 @@ const STATS = [
 
 export default function Landing() {
   const [clock, setClock] = useState("");
+  const { user } = useAuth();
+  const navigate = useNavigate();
+
+  const onPricingCta = async (p) => {
+    if (p.key === "analyst") {
+      navigate(user ? "/dashboard" : "/signup");
+      return;
+    }
+    if (p.key === "firm") {
+      window.location.href = "mailto:founders@clearvault.io?subject=ClearVault%20Firm%20tier";
+      return;
+    }
+    // Desk tier
+    if (!user) {
+      navigate("/signup?next=upgrade");
+      return;
+    }
+    try {
+      const { data } = await api.post("/payments/checkout/session", {
+        package_id: "desk_monthly",
+        origin_url: window.location.origin,
+      });
+      window.location.href = data.url;
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Checkout failed");
+    }
+  };
   useEffect(() => {
     const tick = () => {
       const d = new Date();
@@ -465,6 +495,10 @@ export default function Landing() {
                 <Link
                   to="/signup"
                   data-testid={LANDING.pricingCta(p.key)}
+                  onClick={(e) => {
+                    e.preventDefault();
+                    onPricingCta(p);
+                  }}
                   className={`mt-8 inline-flex items-center justify-center gap-2 px-4 py-3 font-mono text-xs uppercase tracking-widest ${
                     p.accent
                       ? "bg-[var(--cv-primary)] text-black hover:bg-[var(--cv-primary-hover)]"

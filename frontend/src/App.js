@@ -10,6 +10,10 @@ import Dashboard from "@/pages/Dashboard";
 import Deals from "@/pages/Deals";
 import DealDetail from "@/pages/DealDetail";
 import Upload from "@/pages/Upload";
+import Settings from "@/pages/Settings";
+import BillingSuccess from "@/pages/BillingSuccess";
+import BillingCancel from "@/pages/BillingCancel";
+import ShareView from "@/pages/ShareView";
 
 function Protected({ children }) {
   const { user, loading } = useAuth();
@@ -85,6 +89,31 @@ function App() {
                 </Protected>
               }
             />
+            <Route
+              path="/settings"
+              element={
+                <Protected>
+                  <Settings />
+                </Protected>
+              }
+            />
+            <Route
+              path="/billing/success"
+              element={
+                <Protected>
+                  <BillingSuccess />
+                </Protected>
+              }
+            />
+            <Route
+              path="/billing/cancel"
+              element={
+                <Protected>
+                  <BillingCancel />
+                </Protected>
+              }
+            />
+            <Route path="/share/:token" element={<ShareView />} />
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
           <Toaster position="bottom-right" theme="dark" />
