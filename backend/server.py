@@ -120,9 +120,22 @@ async def _ensure_user_org(user_id: str) -> str:
     return org_id
 
 
+async def _backfill_missing_doc_org_ids(user_id: str) -> None:
+    """One-shot backfill: any document owned by this user with no org_id gets its parent deal's org_id."""
+    cursor = db.documents.find({
+        "user_id": user_id,
+        "$or": [{"org_id": None}, {"org_id": {"$exists": False}}],
+    })
+    async for d in cursor:
+        deal = await db.deals.find_one({"_id": d.get("deal_id")})
+        if deal and deal.get("org_id"):
+            await db.documents.update_one({"_id": d["_id"]}, {"$set": {"org_id": deal["org_id"]}})
+
+
 async def _user_org_ids(user_id: str) -> List[str]:
     """All org IDs the user is a member of (auto-creates personal org if missing)."""
     await _ensure_user_org(user_id)
+    await _backfill_missing_doc_org_ids(user_id)
     ids: List[str] = []
     async for m in db.org_members.find({"user_id": user_id}):
         ids.append(m["org_id"])
@@ -145,6 +158,23 @@ async def _accessible_deal(deal_id: str, user_id: str) -> dict:
     if not raw:
         raise HTTPException(status_code=404, detail="Deal not found")
     return raw
+
+
+async def _accessible_document(doc_id: str, user_id: str) -> dict:
+    """Return the doc raw if user has access via the parent deal's org. Falls back to legacy user_id."""
+    org_ids = await _user_org_ids(user_id)
+    raw = await db.documents.find_one({"_id": doc_id})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if raw.get("org_id") and raw["org_id"] in org_ids:
+        return raw
+    # Fallback: check deal's org
+    deal = await db.deals.find_one({"_id": raw.get("deal_id")})
+    if deal and deal.get("org_id") in org_ids:
+        # Backfill the doc's org_id while we're here
+        await db.documents.update_one({"_id": doc_id}, {"$set": {"org_id": deal["org_id"]}})
+        return raw
+    raise HTTPException(status_code=404, detail="Document not found")
 
 
 # ---------- Health ----------
@@ -200,15 +230,16 @@ async def me(user_id: str = Depends(get_current_user_id)):
 # ---------- Dashboard ----------
 @api.get("/dashboard/stats")
 async def dashboard_stats(user_id: str = Depends(get_current_user_id)):
-    deals_total = await db.deals.count_documents({"user_id": user_id})
-    deals_active = await db.deals.count_documents({"user_id": user_id, "status": "active"})
-    docs_total = await db.documents.count_documents({"user_id": user_id})
-    docs_completed = await db.documents.count_documents({"user_id": user_id, "status": "completed"})
+    org_ids = await _user_org_ids(user_id)
+    deals_total = await db.deals.count_documents({"org_id": {"$in": org_ids}})
+    deals_active = await db.deals.count_documents({"org_id": {"$in": org_ids}, "status": "active"})
+    docs_total = await db.documents.count_documents({"org_id": {"$in": org_ids}})
+    docs_completed = await db.documents.count_documents({"org_id": {"$in": org_ids}, "status": "completed"})
 
-    # aggregate red flags across all completed extractions for this user
+    # aggregate red flags across all completed extractions in the user's orgs
     red_flags_total = 0
     high_severity = 0
-    async for d in db.documents.find({"user_id": user_id, "status": "completed"}):
+    async for d in db.documents.find({"org_id": {"$in": org_ids}, "status": "completed"}):
         extracted = d.get("extracted") or {}
         flags = extracted.get("red_flags") or []
         red_flags_total += len(flags)
@@ -381,6 +412,7 @@ async def upload_document(
         file_path=str(target),
         file_size=file_size,
         status="uploaded",
+        org_id=deal_raw.get("org_id"),
     )
     doc_dict = document.to_mongo()
     doc_dict["_id"] = new_id
@@ -405,18 +437,13 @@ async def list_documents(deal_id: str, user_id: str = Depends(get_current_user_i
 
 @api.get("/documents/{doc_id}", response_model=DocumentOut)
 async def get_document(doc_id: str, user_id: str = Depends(get_current_user_id)):
-    raw = await db.documents.find_one({"_id": doc_id, "user_id": user_id})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Document not found")
+    raw = await _accessible_document(doc_id, user_id)
     return _doc_out(Document.from_mongo(raw))
 
 
 @api.delete("/documents/{doc_id}")
 async def delete_document(doc_id: str, user_id: str = Depends(get_current_user_id)):
-    raw = await db.documents.find_one({"_id": doc_id, "user_id": user_id})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Document not found")
-    # remove file
+    raw = await _accessible_document(doc_id, user_id)
     try:
         Path(raw["file_path"]).unlink(missing_ok=True)
     except Exception:
@@ -547,9 +574,7 @@ async def generate_rollup(deal_id: str, user_id: str = Depends(get_current_user_
 
 @api.get("/deals/{deal_id}/rollup")
 async def get_rollup(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Deal not found")
+    raw = await _accessible_deal(deal_id, user_id)
     return {"rollup": raw.get("rollup"), "rollup_at": raw.get("rollup_at")}
 
 
@@ -561,10 +586,11 @@ async def global_search(q: str = Query(""), user_id: str = Depends(get_current_u
     if len(q) < 2:
         return results
 
+    org_ids = await _user_org_ids(user_id)
     rx = {"$regex": q, "$options": "i"}
 
     async for raw in db.deals.find(
-        {"user_id": user_id, "$or": [{"name": rx}, {"target_company": rx}, {"sector": rx}]}
+        {"org_id": {"$in": org_ids}, "$or": [{"name": rx}, {"target_company": rx}, {"sector": rx}]}
     ).limit(8):
         results["deals"].append({
             "id": str(raw["_id"]),
@@ -573,7 +599,7 @@ async def global_search(q: str = Query(""), user_id: str = Depends(get_current_u
             "sector": raw.get("sector"),
         })
 
-    async for raw in db.documents.find({"user_id": user_id, "filename": rx}).limit(8):
+    async for raw in db.documents.find({"org_id": {"$in": org_ids}, "filename": rx}).limit(8):
         results["documents"].append({
             "id": str(raw["_id"]),
             "deal_id": raw.get("deal_id"),
@@ -581,10 +607,9 @@ async def global_search(q: str = Query(""), user_id: str = Depends(get_current_u
             "status": raw.get("status"),
         })
 
-    # red flag search: scan extracted titles
     q_lower = q.lower()
     flags_found = 0
-    async for raw in db.documents.find({"user_id": user_id, "status": "completed"}):
+    async for raw in db.documents.find({"org_id": {"$in": org_ids}, "status": "completed"}):
         if flags_found >= 8:
             break
         for f in (raw.get("extracted") or {}).get("red_flags", []):
@@ -628,9 +653,7 @@ async def get_document_file(
     if not user_id:
         raise HTTPException(status_code=401, detail="Missing or invalid token")
 
-    raw = await db.documents.find_one({"_id": doc_id, "user_id": user_id})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Document not found")
+    raw = await _accessible_document(doc_id, user_id)
     path = Path(raw["file_path"])
     if not path.exists():
         raise HTTPException(status_code=404, detail="File missing on disk")
@@ -1081,6 +1104,10 @@ async def create_invite(payload: OrgInviteCreate, user_id: str = Depends(get_cur
         raise HTTPException(status_code=400, detail="role must be admin or member")
 
     email = payload.email.lower()
+    # Self-invite guard
+    me = await db.users.find_one({"_id": user_id})
+    if me and email == (me.get("email") or "").lower():
+        raise HTTPException(status_code=400, detail="You cannot invite yourself")
     # If user is already a member, short-circuit
     existing_user = await db.users.find_one({"email": email})
     if existing_user:

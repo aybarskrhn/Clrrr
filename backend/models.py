@@ -151,6 +151,7 @@ class DealOut(BaseModel):
 # ---------- Document ----------
 class Document(BaseDocument):
     user_id: str
+    org_id: Optional[str] = None
     deal_id: str
     filename: str
     file_path: str

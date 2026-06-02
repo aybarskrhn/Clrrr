@@ -1,0 +1,37 @@
+{
+  "summary": "Iteration 5 re-test — ClearVault org-scoping bug fixes VERIFIED. Full regression: 158/158 PASS (140 prior + 18 new targeted iteration-5 tests). The single regression from iteration 4 (test_recent_activity) is now FIXED. All 5 critical bugs flagged in iteration 4 are resolved: (1) upload_document now sets org_id from parent deal; (2) GET/DELETE /api/documents/{id} and /api/documents/{id}/file now use _accessible_document (joins doc→deal→org); (3) get_rollup uses _accessible_deal; (4) global_search and dashboard_stats scoped to _user_org_ids; (5) self-invite guard returns 400 'You cannot invite yourself'. Legacy backfill via _backfill_missing_doc_org_ids inside _user_org_ids verified by directly inserting a doc without org_id into Mongo and confirming the next org-scoped read auto-populates org_id from the parent deal.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_iteration5_orgscoping.py",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_billing_share_slack.py",
+    "/app/backend/tests/test_orgs_iteration4.py",
+    "/app/test_reports/pytest/iteration5_full.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "Document.org_id is correctly persisted (verified via mongo) but DocumentOut response model does NOT surface it. Not a bug, but if any frontend code wants to display 'which org owns this doc' it would need the field added to DocumentOut. Cosmetic.",
+    "_backfill_missing_doc_org_ids is run on EVERY call to _user_org_ids — runs an extra documents.find + per-doc deals.find_one + update_one. Once all legacy docs are backfilled this is a no-op cursor (no docs match the $or filter), but the find itself still executes per request. Consider gating by a one-shot flag on user (e.g., user.docs_backfilled=true) once the find returns zero rows, to avoid the per-request scan. Performance only — correctness is fine.",
+    "_accessible_document also does an in-line backfill (server.py:175) which is correct and idempotent. Good defensive code.",
+    "Self-invite guard at server.py:1110 raises HTTPException(400, 'You cannot invite yourself'). Verified case-insensitive (Pydantic EmailStr normalises to lowercase). Solid.",
+    "models.Document.org_id was added (line 154) as Optional[str] = None. Pydantic round-trip via to_mongo/from_mongo works. Good."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_iteration5_orgscoping.py (new — 18 targeted iteration-5 verification tests in 5 classes)"
+  ],
+  "success_rate": {
+    "backend": "158/158 (100%) — 140 prior tests + 18 new iteration-5 verification tests",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "Per-run users created in iteration5 test file: i5a_<hex>@clearvault.io, i5b_<hex>@clearvault.io, i5c_<hex>@clearvault.io (password Vault123!). All deleted in module teardown.",
+  "seed_data_creation": "Per-run: 3 fresh users (A owner, B invited member, C cross-org outsider), 1 deal owned by A, 1 active invite accepted by B, 2 PDF uploads (one kept for shared-access tests, one for delete test), 2 legacy docs inserted directly to mongo without org_id to exercise backfill paths. All cleaned up in teardown.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Five pytest files now cover the backend: backend_test.py (26), test_new_features.py (34), test_billing_share_slack.py (40), test_orgs_iteration4.py (40), test_iteration5_orgscoping.py (18) = 158 tests total, all passing. Run with `REACT_APP_BACKEND_URL=https://ui-build-showcase.preview.emergentagent.com MONGO_URL=mongodb://localhost:27017 DB_NAME=test_database pytest /app/backend/tests/ -v` (takes ~2m40s). The iteration-5 file requires pymongo for legacy-doc backfill verification + cleanup. No outstanding bugs.",
+  "rca of the issue": "Iteration 4 bugs (documents not assigned org_id; GET/DELETE/file/rollup/search/stats still filtering by user_id) are all RESOLVED in iteration 5: (a) Document Pydantic model gained org_id: Optional[str] = None (models.py:154); (b) upload_document now writes org_id=deal_raw.get('org_id') (server.py:415); (c) get_document/delete_document/get_document_file all route through _accessible_document (server.py:163-176) which checks doc.org_id ∈ user's orgs, with auto-backfill via the parent deal's org_id; (d) get_rollup now uses _accessible_deal; (e) global_search filters deals and documents by {'org_id': {'$in': org_ids}}; (f) dashboard_stats counts use org_ids; (g) _user_org_ids() calls _backfill_missing_doc_org_ids() so legacy data is healed on first access by any org member; (h) create_invite raises 400 with 'You cannot invite yourself' if normalised email == inviter email. Verified all 5 fix categories with direct mongo inspection + multi-user HTTP probes."
+}
