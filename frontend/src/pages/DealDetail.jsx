@@ -642,6 +642,8 @@ function PreviewTab({ docs, selected, setSelected, ex }) {
 function RollupTab({ dealId, rollup, rollupAt, onGenerate, loading, completedCount }) {
   const [share, setShare] = useState(null);
   const [shareLoading, setShareLoading] = useState(false);
+  const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [shareForm, setShareForm] = useState({ expires_in_days: "", password: "" });
 
   useEffect(() => {
     if (!rollup) return;
@@ -651,9 +653,14 @@ function RollupTab({ dealId, rollup, rollupAt, onGenerate, loading, completedCou
   const createShare = async () => {
     setShareLoading(true);
     try {
-      const { data } = await api.post(`/deals/${dealId}/share`);
+      const body = {};
+      const days = parseInt(shareForm.expires_in_days, 10);
+      if (!Number.isNaN(days) && days > 0) body.expires_in_days = days;
+      if (shareForm.password.trim()) body.password = shareForm.password.trim();
+      const { data } = await api.post(`/deals/${dealId}/share`, body);
       setShare(data);
-      toast.success("Share link created.");
+      setShareDialogOpen(false);
+      toast.success("Share link minted.");
     } catch (err) {
       toast.error(err?.response?.data?.detail || "Share failed");
     } finally {
@@ -712,15 +719,21 @@ function RollupTab({ dealId, rollup, rollupAt, onGenerate, loading, completedCou
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {rollup && !share && (
+          {rollup && (
             <button
-              onClick={createShare}
+              onClick={() => {
+                setShareForm({
+                  expires_in_days: share?.expires_at ? "7" : "",
+                  password: "",
+                });
+                setShareDialogOpen(true);
+              }}
               disabled={shareLoading}
               data-testid="deal-share-btn"
               className="flex items-center gap-2 border border-[var(--cv-border)] px-3 py-2.5 font-mono text-xs uppercase tracking-widest text-[var(--cv-muted)] hover:border-[var(--cv-primary)] hover:text-[var(--cv-primary)] disabled:opacity-60"
             >
               {shareLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Share2 className="h-3.5 w-3.5" />}
-              Share
+              {share ? "Re-share" : "Share"}
             </button>
           )}
           <button
@@ -749,6 +762,10 @@ function RollupTab({ dealId, rollup, rollupAt, onGenerate, loading, completedCou
           <span className="font-mono text-[11px] uppercase tracking-widest text-[var(--cv-primary)]">
             Public link active
           </span>
+          {share.has_password && <span className="cv-chip cv-chip-amber">password-protected</span>}
+          {share.expires_at && (
+            <span className="cv-chip">expires {share.expires_at.slice(0, 10)}</span>
+          )}
           <input
             readOnly
             value={shareUrl || ""}
@@ -773,6 +790,80 @@ function RollupTab({ dealId, rollup, rollupAt, onGenerate, loading, completedCou
           <span className="font-mono text-[10px] text-[var(--cv-muted)]">
             {share.view_count} view{share.view_count === 1 ? "" : "s"}
           </span>
+        </div>
+      )}
+
+      {/* Share dialog */}
+      {shareDialogOpen && (
+        <div
+          onClick={() => setShareDialogOpen(false)}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            data-testid="deal-share-dialog"
+            className="w-full max-w-md border border-[var(--cv-primary)] bg-[var(--cv-surface)] p-6"
+          >
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="font-mono text-[11px] uppercase tracking-widest text-[var(--cv-primary)]">
+                  {share ? "Re-share" : "Share IC memo"}
+                </div>
+                <h3 className="mt-1 font-heading text-xl font-bold tracking-tight">Link settings</h3>
+              </div>
+              <button onClick={() => setShareDialogOpen(false)} className="text-[var(--cv-muted)] hover:text-[var(--cv-text)]">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mt-3 font-body text-sm text-[var(--cv-muted)]">
+              Generate a read-only public link. Use the controls below to add an expiry or a
+              password. {share && "Saving will replace the current link."}
+            </p>
+
+            <label className="mt-5 block font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
+              Expires after (days) — leave blank for no expiry
+            </label>
+            <input
+              type="number"
+              min="1"
+              max="365"
+              value={shareForm.expires_in_days}
+              onChange={(e) => setShareForm({ ...shareForm, expires_in_days: e.target.value })}
+              data-testid="deal-share-expiry-input"
+              placeholder="e.g. 7"
+              className="mt-2 w-full border border-[var(--cv-border)] bg-[var(--cv-bg)] px-3 py-2 font-mono text-sm outline-none focus:border-[var(--cv-primary)]"
+            />
+
+            <label className="mt-4 block font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
+              Password — leave blank for no password
+            </label>
+            <input
+              type="text"
+              value={shareForm.password}
+              onChange={(e) => setShareForm({ ...shareForm, password: e.target.value })}
+              data-testid="deal-share-password-input"
+              placeholder="optional"
+              className="mt-2 w-full border border-[var(--cv-border)] bg-[var(--cv-bg)] px-3 py-2 font-mono text-sm outline-none focus:border-[var(--cv-primary)]"
+            />
+
+            <div className="mt-6 flex items-center justify-end gap-2">
+              <button
+                onClick={() => setShareDialogOpen(false)}
+                className="border border-[var(--cv-border)] px-3 py-2 font-mono text-xs uppercase tracking-widest text-[var(--cv-muted)] hover:border-[var(--cv-primary)] hover:text-[var(--cv-primary)]"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={createShare}
+                disabled={shareLoading}
+                data-testid="deal-share-submit"
+                className="flex items-center gap-2 bg-[var(--cv-primary)] px-4 py-2 font-mono text-xs font-semibold uppercase tracking-widest text-black hover:bg-[var(--cv-primary-hover)] disabled:opacity-60"
+              >
+                {shareLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Share2 className="h-3.5 w-3.5" />}
+                {share ? "Mint new link" : "Create link"}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

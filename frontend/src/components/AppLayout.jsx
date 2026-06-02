@@ -2,7 +2,7 @@ import { Link, NavLink, useNavigate } from "react-router-dom";
 import { useEffect, useState } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { NAV } from "@/constants/testIds";
-import { LogOut, LayoutDashboard, FolderKanban, UploadCloud, Search, Settings as Cog } from "lucide-react";
+import { LogOut, LayoutDashboard, FolderKanban, UploadCloud, Search, Settings as Cog, Users } from "lucide-react";
 import TickerBar from "@/components/TickerBar";
 import CommandPalette from "@/components/CommandPalette";
 
@@ -86,6 +86,9 @@ export default function AppLayout({ children }) {
             </NavLink>
             <NavLink to="/upload" className={navItem} data-testid={NAV.uploadLink}>
               <UploadCloud className="h-3.5 w-3.5" /> Ingest PDF
+            </NavLink>
+            <NavLink to="/team" className={navItem} data-testid="nav-team-link">
+              <Users className="h-3.5 w-3.5" /> Team
             </NavLink>
             <NavLink to="/settings" className={navItem} data-testid="nav-settings-link">
               <Cog className="h-3.5 w-3.5" /> Settings

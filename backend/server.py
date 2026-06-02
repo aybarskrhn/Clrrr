@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional
 
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr
 from pymongo import ReturnDocument
 from starlette.middleware.cors import CORSMiddleware
 
@@ -64,6 +65,7 @@ def user_public(user: User) -> UserPublic:
         plan=user.plan,
         plan_active_until=user.plan_active_until,
         slack_webhook_url=user.slack_webhook_url,
+        current_org_id=user.current_org_id,
         created_at=user.created_at,
     )
 
@@ -73,6 +75,76 @@ async def _find_user_by_id(user_id: str) -> User:
     if not doc:
         raise HTTPException(status_code=404, detail="User not found")
     return User.from_mongo(doc)
+
+
+# ---------- Organization helpers ----------
+async def _ensure_user_org(user_id: str) -> str:
+    """Return the user's current org_id, creating a personal org + backfilling
+    legacy deals/documents the first time we see this user."""
+    user_doc = await db.users.find_one({"_id": user_id})
+    if not user_doc:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    if user_doc.get("current_org_id"):
+        return user_doc["current_org_id"]
+
+    # First-time setup — personal org
+    org_id = str(uuid.uuid4())
+    name = user_doc.get("name") or user_doc.get("email", "Personal").split("@")[0]
+    await db.organizations.insert_one({
+        "_id": org_id,
+        "name": f"{name}'s workspace",
+        "owner_id": user_id,
+        "plan": user_doc.get("plan", "trial"),
+        "plan_active_until": user_doc.get("plan_active_until"),
+        "created_at": now_iso(),
+    })
+    await db.org_members.insert_one({
+        "_id": str(uuid.uuid4()),
+        "org_id": org_id,
+        "user_id": user_id,
+        "role": "owner",
+        "joined_at": now_iso(),
+    })
+    await db.users.update_one({"_id": user_id}, {"$set": {"current_org_id": org_id}})
+
+    # Backfill any legacy deals owned by this user that don't yet have org_id
+    await db.deals.update_many(
+        {"user_id": user_id, "$or": [{"org_id": None}, {"org_id": {"$exists": False}}]},
+        {"$set": {"org_id": org_id}},
+    )
+    await db.documents.update_many(
+        {"user_id": user_id, "$or": [{"org_id": None}, {"org_id": {"$exists": False}}]},
+        {"$set": {"org_id": org_id}},
+    )
+    return org_id
+
+
+async def _user_org_ids(user_id: str) -> List[str]:
+    """All org IDs the user is a member of (auto-creates personal org if missing)."""
+    await _ensure_user_org(user_id)
+    ids: List[str] = []
+    async for m in db.org_members.find({"user_id": user_id}):
+        ids.append(m["org_id"])
+    return ids
+
+
+async def _require_org_role(org_id: str, user_id: str, *, roles: List[str]) -> dict:
+    m = await db.org_members.find_one({"org_id": org_id, "user_id": user_id})
+    if not m:
+        raise HTTPException(status_code=403, detail="Not a member of this organization")
+    if m.get("role") not in roles:
+        raise HTTPException(status_code=403, detail=f"Requires role: {' or '.join(roles)}")
+    return m
+
+
+async def _accessible_deal(deal_id: str, user_id: str) -> dict:
+    """Return the deal raw doc if accessible by this user (via any org membership), else 404."""
+    org_ids = await _user_org_ids(user_id)
+    raw = await db.deals.find_one({"_id": deal_id, "org_id": {"$in": org_ids}})
+    if not raw:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    return raw
 
 
 # ---------- Health ----------
@@ -112,12 +184,15 @@ async def login(payload: LoginRequest):
     user = User.from_mongo(doc)
     if not verify_password(payload.password, user.password_hash):
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    # Ensure org exists for legacy users
+    user.current_org_id = await _ensure_user_org(user.id)
     token = create_token(user.id, user.email)
     return AuthResponse(token=token, user=user_public(user))
 
 
 @api.get("/auth/me", response_model=UserPublic)
 async def me(user_id: str = Depends(get_current_user_id)):
+    await _ensure_user_org(user_id)
     user = await _find_user_by_id(user_id)
     return user_public(user)
 
@@ -172,8 +247,9 @@ async def _deal_out(deal: Deal) -> DealOut:
 
 @api.get("/deals", response_model=List[DealOut])
 async def list_deals(user_id: str = Depends(get_current_user_id)):
+    org_ids = await _user_org_ids(user_id)
     out: List[DealOut] = []
-    cursor = db.deals.find({"user_id": user_id}).sort("created_at", -1)
+    cursor = db.deals.find({"org_id": {"$in": org_ids}}).sort("created_at", -1)
     async for raw in cursor:
         deal = Deal.from_mongo(raw)
         out.append(await _deal_out(deal))
@@ -182,8 +258,14 @@ async def list_deals(user_id: str = Depends(get_current_user_id)):
 
 @api.post("/deals", response_model=DealOut)
 async def create_deal(payload: DealCreate, user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    # Use the user's current_org_id if set, else the just-created personal org
+    user_doc = await db.users.find_one({"_id": user_id})
+    target_org = (user_doc or {}).get("current_org_id") or org_id
+
     deal = Deal(
         user_id=user_id,
+        org_id=target_org,
         name=payload.name,
         target_company=payload.target_company,
         sector=payload.sector or "Industrials",
@@ -199,18 +281,14 @@ async def create_deal(payload: DealCreate, user_id: str = Depends(get_current_us
 
 @api.get("/deals/{deal_id}", response_model=DealOut)
 async def get_deal(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
-    if not raw:
-        raise HTTPException(status_code=404, detail="Deal not found")
+    raw = await _accessible_deal(deal_id, user_id)
     return await _deal_out(Deal.from_mongo(raw))
 
 
 @api.delete("/deals/{deal_id}")
 async def delete_deal(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    res = await db.deals.delete_one({"_id": deal_id, "user_id": user_id})
-    if res.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Deal not found")
-    # also delete child documents
+    raw = await _accessible_deal(deal_id, user_id)
+    await db.deals.delete_one({"_id": deal_id})
     await db.documents.delete_many({"deal_id": deal_id})
     return {"deleted": True}
 
@@ -282,7 +360,7 @@ async def upload_document(
     file: UploadFile = File(...),
     user_id: str = Depends(get_current_user_id),
 ):
-    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    deal_raw = await _accessible_deal(deal_id, user_id)
     if not deal_raw:
         raise HTTPException(status_code=404, detail="Deal not found")
 
@@ -315,7 +393,7 @@ async def upload_document(
 
 @api.get("/deals/{deal_id}/documents", response_model=List[DocumentOut])
 async def list_documents(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    deal_raw = await _accessible_deal(deal_id, user_id)
     if not deal_raw:
         raise HTTPException(status_code=404, detail="Deal not found")
     out: List[DocumentOut] = []
@@ -350,8 +428,9 @@ async def delete_document(doc_id: str, user_id: str = Depends(get_current_user_i
 # ---------- Recent activity ----------
 @api.get("/activity/recent")
 async def recent_activity(user_id: str = Depends(get_current_user_id), limit: int = 8):
+    org_ids = await _user_org_ids(user_id)
     items = []
-    async for raw in db.documents.find({"user_id": user_id}).sort("created_at", -1).limit(limit):
+    async for raw in db.documents.find({"org_id": {"$in": org_ids}}).sort("created_at", -1).limit(limit):
         items.append(
             {
                 "id": str(raw["_id"]),
@@ -367,7 +446,7 @@ async def recent_activity(user_id: str = Depends(get_current_user_id), limit: in
 # ---------- CSV export ----------
 @api.get("/deals/{deal_id}/export.csv")
 async def export_deal_csv(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    deal_raw = await _accessible_deal(deal_id, user_id)
     if not deal_raw:
         raise HTTPException(status_code=404, detail="Deal not found")
 
@@ -435,7 +514,7 @@ async def export_deal_csv(deal_id: str, user_id: str = Depends(get_current_user_
 # ---------- Roll-up summary ----------
 @api.post("/deals/{deal_id}/rollup")
 async def generate_rollup(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
+    deal_raw = await _accessible_deal(deal_id, user_id)
     if not deal_raw:
         raise HTTPException(status_code=404, detail="Deal not found")
     deal = Deal.from_mongo(deal_raw)
@@ -603,64 +682,127 @@ def _gen_share_token() -> str:
     return uuid.uuid4().hex + uuid.uuid4().hex[:8]  # 40 chars
 
 
+def _share_expired(share: dict) -> bool:
+    exp = share.get("expires_at")
+    if not exp:
+        return False
+    try:
+        return datetime.fromisoformat(exp.replace("Z", "+00:00")) < datetime.now(timezone.utc)
+    except Exception:
+        return False
+
+
+class ShareCreate(BaseModel):
+    expires_in_days: Optional[int] = None  # None = no expiry
+    password: Optional[str] = None
+
+
+class ShareUnlock(BaseModel):
+    password: str
+
+
 @api.post("/deals/{deal_id}/share")
-async def create_share(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
-    if not deal_raw:
-        raise HTTPException(status_code=404, detail="Deal not found")
+async def create_share(
+    deal_id: str,
+    payload: Optional[ShareCreate] = None,
+    user_id: str = Depends(get_current_user_id),
+):
+    deal_raw = await _accessible_deal(deal_id, user_id)
     if not deal_raw.get("rollup"):
         raise HTTPException(status_code=400, detail="Generate the IC roll-up before sharing.")
 
+    payload = payload or ShareCreate()
+    expires_at = None
+    if payload.expires_in_days and payload.expires_in_days > 0:
+        expires_at = (datetime.now(timezone.utc) + timedelta(days=payload.expires_in_days)).isoformat()
+
+    password_hash = hash_password(payload.password) if payload.password else None
+
+    # If an existing active share matches the same settings, return it (idempotent).
+    # Otherwise revoke and mint a new one (so password/expiry updates take effect).
     existing = await db.shares.find_one({"deal_id": deal_id, "revoked": {"$ne": True}})
     if existing:
-        return {
-            "token": existing["_id"],
-            "url_path": f"/share/{existing['_id']}",
-            "created_at": existing.get("created_at"),
-            "view_count": existing.get("view_count", 0),
-        }
+        if (
+            (existing.get("expires_at") == expires_at)
+            and (bool(existing.get("password_hash")) == bool(password_hash))
+            and not _share_expired(existing)
+        ):
+            return _share_out(existing)
+        # settings changed → revoke and recreate
+        await db.shares.update_one({"_id": existing["_id"]}, {"$set": {"revoked": True}})
 
     token = _gen_share_token()
-    await db.shares.insert_one(
-        {
-            "_id": token,
-            "deal_id": deal_id,
-            "user_id": user_id,
-            "created_at": now_iso(),
-            "view_count": 0,
-            "revoked": False,
-        }
-    )
-    return {"token": token, "url_path": f"/share/{token}", "created_at": now_iso(), "view_count": 0}
+    doc = {
+        "_id": token,
+        "deal_id": deal_id,
+        "user_id": user_id,
+        "created_at": now_iso(),
+        "view_count": 0,
+        "revoked": False,
+        "expires_at": expires_at,
+        "password_hash": password_hash,
+    }
+    await db.shares.insert_one(doc)
+    return _share_out(doc)
+
+
+def _share_out(share: dict) -> dict:
+    return {
+        "token": share["_id"],
+        "url_path": f"/share/{share['_id']}",
+        "created_at": share.get("created_at"),
+        "view_count": share.get("view_count", 0),
+        "expires_at": share.get("expires_at"),
+        "has_password": bool(share.get("password_hash")),
+    }
 
 
 @api.get("/deals/{deal_id}/share")
 async def get_share(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    existing = await db.shares.find_one({"deal_id": deal_id, "user_id": user_id, "revoked": {"$ne": True}})
+    await _accessible_deal(deal_id, user_id)
+    existing = await db.shares.find_one({"deal_id": deal_id, "revoked": {"$ne": True}})
     if not existing:
         return {"token": None}
-    return {
-        "token": existing["_id"],
-        "url_path": f"/share/{existing['_id']}",
-        "created_at": existing.get("created_at"),
-        "view_count": existing.get("view_count", 0),
-    }
+    if _share_expired(existing):
+        return {"token": None, "expired": True}
+    return _share_out(existing)
 
 
 @api.delete("/deals/{deal_id}/share")
 async def revoke_share(deal_id: str, user_id: str = Depends(get_current_user_id)):
-    deal_raw = await db.deals.find_one({"_id": deal_id, "user_id": user_id})
-    if not deal_raw:
-        raise HTTPException(status_code=404, detail="Deal not found")
-    await db.shares.update_many({"deal_id": deal_id, "user_id": user_id}, {"$set": {"revoked": True}})
+    await _accessible_deal(deal_id, user_id)
+    await db.shares.update_many({"deal_id": deal_id}, {"$set": {"revoked": True}})
     return {"revoked": True}
 
 
-@api.get("/share/{token}")
-async def view_share(token: str):
+@api.get("/share/{token}/meta")
+async def share_meta(token: str):
+    """Public — lets the viewer know if a password is required & whether the link is alive."""
     share = await db.shares.find_one({"_id": token, "revoked": {"$ne": True}})
     if not share:
         raise HTTPException(status_code=404, detail="Share link not found or revoked")
+    if _share_expired(share):
+        raise HTTPException(status_code=410, detail="This share link has expired")
+    deal_raw = await db.deals.find_one({"_id": share["deal_id"]})
+    if not deal_raw or not deal_raw.get("rollup"):
+        raise HTTPException(status_code=410, detail="The IC memo has been removed")
+    return {
+        "has_password": bool(share.get("password_hash")),
+        "expires_at": share.get("expires_at"),
+        "deal_name": deal_raw.get("name"),
+        "target_company": deal_raw.get("target_company"),
+    }
+
+
+async def _resolve_share(token: str, password: Optional[str]) -> dict:
+    share = await db.shares.find_one({"_id": token, "revoked": {"$ne": True}})
+    if not share:
+        raise HTTPException(status_code=404, detail="Share link not found or revoked")
+    if _share_expired(share):
+        raise HTTPException(status_code=410, detail="This share link has expired")
+    if share.get("password_hash"):
+        if not password or not verify_password(password, share["password_hash"]):
+            raise HTTPException(status_code=401, detail="Password required or incorrect")
     deal_raw = await db.deals.find_one({"_id": share["deal_id"]})
     if not deal_raw:
         raise HTTPException(status_code=404, detail="Deal no longer exists")
@@ -682,8 +824,19 @@ async def view_share(token: str):
         "rollup": deal_raw.get("rollup"),
         "rollup_at": deal_raw.get("rollup_at"),
         "shared_at": share.get("created_at"),
+        "expires_at": share.get("expires_at"),
         "view_count": (updated or share).get("view_count", 1),
     }
+
+
+@api.get("/share/{token}")
+async def view_share(token: str):
+    return await _resolve_share(token, None)
+
+
+@api.post("/share/{token}/unlock")
+async def unlock_share(token: str, payload: ShareUnlock):
+    return await _resolve_share(token, payload.password)
 
 
 # =============================================================
@@ -794,7 +947,6 @@ async def checkout_status(session_id: str, request: Request, user_id: str = Depe
 
 def _plan_end(package_id: Optional[str]) -> str:
     """Return ISO string for plan expiry — monthly = +30d, annual = +365d."""
-    from datetime import datetime, timedelta, timezone
     days = 365 if (package_id or "").endswith("annual") else 30
     return (datetime.now(timezone.utc) + timedelta(days=days)).isoformat()
 
@@ -810,8 +962,28 @@ async def stripe_webhook(request: Request):
         logger.warning("Stripe webhook verify failed: %s", exc)
         raise HTTPException(status_code=400, detail="Invalid webhook")
 
+    event_id = getattr(evt, "event_id", None)
     session_id = getattr(evt, "session_id", None)
     payment_status = getattr(evt, "payment_status", None)
+
+    # Replay protection — reject duplicate event_id (idempotency)
+    if event_id:
+        seen = await db.stripe_events.find_one({"_id": event_id})
+        if seen:
+            logger.info("Stripe webhook replay ignored: %s", event_id)
+            return {"ok": True, "replayed": True}
+        try:
+            await db.stripe_events.insert_one({
+                "_id": event_id,
+                "session_id": session_id,
+                "event_type": getattr(evt, "event_type", None),
+                "received_at": now_iso(),
+            })
+        except Exception:
+            # If another worker inserted the same event between our check and insert,
+            # treat as replay (race condition is rare but possible).
+            return {"ok": True, "replayed": True}
+
     if not session_id:
         return {"ok": True}
 
@@ -829,6 +1001,256 @@ async def stripe_webhook(request: Request):
             {"$set": {"plan": txn.get("plan", "desk"), "plan_active_until": _plan_end(txn.get("package_id"))}},
         )
     return {"ok": True}
+
+
+# (org routes appended below; app.include_router(api) is called once at the very end)
+
+
+# =============================================================
+# Organizations / Teams — multi-seat workspaces
+# =============================================================
+class OrgUpdate(BaseModel):
+    name: Optional[str] = None
+
+
+class OrgInviteCreate(BaseModel):
+    email: EmailStr
+    role: str = "member"  # member | admin
+
+
+class OrgMemberUpdate(BaseModel):
+    role: str  # admin | member
+
+
+@api.get("/orgs/current")
+async def get_current_org(user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    org = await db.organizations.find_one({"_id": org_id})
+    if not org:
+        raise HTTPException(status_code=404, detail="Org not found")
+
+    members = []
+    async for m in db.org_members.find({"org_id": org_id}):
+        u = await db.users.find_one({"_id": m["user_id"]})
+        members.append({
+            "user_id": m["user_id"],
+            "role": m.get("role"),
+            "joined_at": m.get("joined_at"),
+            "email": (u or {}).get("email"),
+            "name": (u or {}).get("name"),
+        })
+    invites = []
+    async for inv in db.org_invites.find({"org_id": org_id, "accepted_at": None, "revoked": {"$ne": True}}):
+        invites.append({
+            "id": str(inv["_id"]),
+            "email": inv.get("email"),
+            "role": inv.get("role"),
+            "created_at": inv.get("created_at"),
+        })
+
+    my_role = next((m["role"] for m in members if m["user_id"] == user_id), "member")
+    return {
+        "id": org["_id"],
+        "name": org.get("name"),
+        "owner_id": org.get("owner_id"),
+        "plan": org.get("plan", "trial"),
+        "plan_active_until": org.get("plan_active_until"),
+        "my_role": my_role,
+        "members": members,
+        "pending_invites": invites,
+    }
+
+
+@api.patch("/orgs/current")
+async def update_org(payload: OrgUpdate, user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    await _require_org_role(org_id, user_id, roles=["owner", "admin"])
+    update = {}
+    if payload.name is not None and payload.name.strip():
+        update["name"] = payload.name.strip()
+    if update:
+        await db.organizations.update_one({"_id": org_id}, {"$set": update})
+    return await get_current_org(user_id=user_id)  # type: ignore
+
+
+@api.post("/orgs/current/invites")
+async def create_invite(payload: OrgInviteCreate, user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    await _require_org_role(org_id, user_id, roles=["owner", "admin"])
+    if payload.role not in ("admin", "member"):
+        raise HTTPException(status_code=400, detail="role must be admin or member")
+
+    email = payload.email.lower()
+    # If user is already a member, short-circuit
+    existing_user = await db.users.find_one({"email": email})
+    if existing_user:
+        already = await db.org_members.find_one({"org_id": org_id, "user_id": existing_user["_id"]})
+        if already:
+            raise HTTPException(status_code=400, detail="User is already a member of this organization")
+
+    # Revoke any prior pending invite to the same email for this org (idempotent re-invite)
+    await db.org_invites.update_many(
+        {"org_id": org_id, "email": email, "accepted_at": None, "revoked": {"$ne": True}},
+        {"$set": {"revoked": True}},
+    )
+
+    token = uuid.uuid4().hex
+    await db.org_invites.insert_one({
+        "_id": token,
+        "org_id": org_id,
+        "email": email,
+        "role": payload.role,
+        "invited_by": user_id,
+        "accepted_at": None,
+        "revoked": False,
+        "created_at": now_iso(),
+    })
+    org = await db.organizations.find_one({"_id": org_id})
+    return {
+        "token": token,
+        "url_path": f"/invite/{token}",
+        "email": email,
+        "role": payload.role,
+        "org_name": (org or {}).get("name"),
+    }
+
+
+@api.delete("/orgs/current/invites/{invite_id}")
+async def revoke_invite(invite_id: str, user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    await _require_org_role(org_id, user_id, roles=["owner", "admin"])
+    res = await db.org_invites.update_one(
+        {"_id": invite_id, "org_id": org_id},
+        {"$set": {"revoked": True}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Invite not found")
+    return {"revoked": True}
+
+
+@api.get("/invites/{token}")
+async def get_invite(token: str):
+    """Public — lets the invitee see what they're being invited to before logging in."""
+    inv = await db.org_invites.find_one({"_id": token, "revoked": {"$ne": True}, "accepted_at": None})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invite not found, revoked, or already accepted")
+    org = await db.organizations.find_one({"_id": inv["org_id"]})
+    inviter = await db.users.find_one({"_id": inv["invited_by"]})
+    return {
+        "token": token,
+        "email": inv.get("email"),
+        "role": inv.get("role"),
+        "org_id": inv.get("org_id"),
+        "org_name": (org or {}).get("name"),
+        "invited_by": (inviter or {}).get("name") or (inviter or {}).get("email"),
+        "created_at": inv.get("created_at"),
+    }
+
+
+@api.post("/invites/{token}/accept")
+async def accept_invite(token: str, user_id: str = Depends(get_current_user_id)):
+    inv = await db.org_invites.find_one({"_id": token, "revoked": {"$ne": True}, "accepted_at": None})
+    if not inv:
+        raise HTTPException(status_code=404, detail="Invite not found, revoked, or already accepted")
+
+    user = await db.users.find_one({"_id": user_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user.get("email", "").lower() != inv.get("email", "").lower():
+        raise HTTPException(status_code=403, detail="This invite is for a different email address")
+
+    org_id = inv["org_id"]
+    already = await db.org_members.find_one({"org_id": org_id, "user_id": user_id})
+    if not already:
+        await db.org_members.insert_one({
+            "_id": str(uuid.uuid4()),
+            "org_id": org_id,
+            "user_id": user_id,
+            "role": inv.get("role", "member"),
+            "joined_at": now_iso(),
+        })
+
+    await db.org_invites.update_one(
+        {"_id": token},
+        {"$set": {"accepted_at": now_iso()}},
+    )
+    # Switch user's active workspace to the new org
+    await db.users.update_one({"_id": user_id}, {"$set": {"current_org_id": org_id}})
+    org = await db.organizations.find_one({"_id": org_id})
+    return {
+        "joined_org_id": org_id,
+        "joined_org_name": (org or {}).get("name"),
+        "role": inv.get("role", "member"),
+    }
+
+
+@api.patch("/orgs/current/members/{member_user_id}")
+async def update_member(member_user_id: str, payload: OrgMemberUpdate, user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    await _require_org_role(org_id, user_id, roles=["owner"])
+    if payload.role not in ("admin", "member"):
+        raise HTTPException(status_code=400, detail="role must be admin or member")
+    if member_user_id == user_id:
+        raise HTTPException(status_code=400, detail="Owner cannot demote themselves")
+    res = await db.org_members.update_one(
+        {"org_id": org_id, "user_id": member_user_id},
+        {"$set": {"role": payload.role}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"updated": True}
+
+
+@api.delete("/orgs/current/members/{member_user_id}")
+async def remove_member(member_user_id: str, user_id: str = Depends(get_current_user_id)):
+    org_id = await _ensure_user_org(user_id)
+    await _require_org_role(org_id, user_id, roles=["owner", "admin"])
+    if member_user_id == user_id:
+        raise HTTPException(status_code=400, detail="Cannot remove yourself; transfer ownership first")
+    target = await db.org_members.find_one({"org_id": org_id, "user_id": member_user_id})
+    if not target:
+        raise HTTPException(status_code=404, detail="Member not found")
+    if target.get("role") == "owner":
+        raise HTTPException(status_code=400, detail="Cannot remove the owner")
+    await db.org_members.delete_one({"org_id": org_id, "user_id": member_user_id})
+    # If the removed user's current_org_id was this org, fall back to their personal org
+    other = await db.org_members.find_one({"user_id": member_user_id})
+    fallback = other["org_id"] if other else None
+    if not fallback:
+        # Re-provision a personal org for them
+        fallback = await _ensure_user_org(member_user_id)
+    await db.users.update_one(
+        {"_id": member_user_id, "current_org_id": org_id},
+        {"$set": {"current_org_id": fallback}},
+    )
+    return {"removed": True}
+
+
+@api.get("/orgs/me/orgs")
+async def list_my_orgs(user_id: str = Depends(get_current_user_id)):
+    await _ensure_user_org(user_id)
+    out = []
+    async for m in db.org_members.find({"user_id": user_id}):
+        org = await db.organizations.find_one({"_id": m["org_id"]})
+        if not org:
+            continue
+        out.append({
+            "id": org["_id"],
+            "name": org.get("name"),
+            "role": m.get("role"),
+            "owner_id": org.get("owner_id"),
+            "plan": org.get("plan", "trial"),
+        })
+    return {"orgs": out}
+
+
+@api.post("/orgs/switch/{org_id}")
+async def switch_org(org_id: str, user_id: str = Depends(get_current_user_id)):
+    m = await db.org_members.find_one({"org_id": org_id, "user_id": user_id})
+    if not m:
+        raise HTTPException(status_code=404, detail="Not a member of this organization")
+    await db.users.update_one({"_id": user_id}, {"$set": {"current_org_id": org_id}})
+    return {"current_org_id": org_id}
 
 
 app.include_router(api)

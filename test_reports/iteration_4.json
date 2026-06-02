@@ -1,0 +1,99 @@
+{
+  "summary": "Iteration 4 — Org/team workspaces + share expiry/password + Stripe replay protection. New test file test_orgs_iteration4.py: 40/40 PASS covering org auto-provisioning, invites (create/revoke/accept/idempotency), role mgmt, switch-org, cross-user isolation, share password+expiry (incl. DB-backdated 410), and Stripe webhook 400 smoke. Regression sweep across the previous 3 test files: 99/100 — one PRE-EXISTING test (test_recent_activity) now FAILS, exposing a real org-refactor bug: documents are inserted WITHOUT org_id, but /api/activity/recent (and several other endpoints) were rewritten to filter by org_id → endpoint silently returns empty for every user. Additional broken endpoints found via targeted multi-seat probe: GET /api/documents/{id}, DELETE /api/documents/{id}, GET /api/deals/{id}/rollup, GET /api/search, /api/dashboard/stats — all still filter by user_id and therefore deny access to legitimate org members. Total: 139/140 across all four pytest files.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/deals/{deal_id}/documents + GET /api/activity/recent",
+        "issue": "REGRESSION introduced by org refactor: upload_document() creates a Document with no org_id field (the Document model in models.py does not even declare org_id), so every newly-uploaded doc lands in Mongo with org_id=None. /api/activity/recent then filters by {org_id: {$in: org_ids}} and matches nothing — endpoint returns [] for ALL users. Verified directly: c.documents.count_documents({}) = 1, with_org_id = 0. Backend test_recent_activity fails: assert 0 >= 1.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "GET /api/documents/{doc_id}",
+        "issue": "Still filters by {_id, user_id: user_id} — org member who can list documents via /api/deals/{id}/documents (because that path uses _accessible_deal) CANNOT fetch the individual document → 404. Verified: B is admin of A's org, lists doc successfully, then GET /api/documents/<id> returns 404. Multi-seat workflow is broken.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "DELETE /api/documents/{doc_id}",
+        "issue": "Same root cause as GET — filters by user_id, so org admins/owners cannot delete documents uploaded by other members. Inconsistent with deal-level deletion which uses _accessible_deal.",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "GET /api/deals/{deal_id}/rollup",
+        "issue": "server.py:550 — db.deals.find_one({'_id': deal_id, 'user_id': user_id}). Org members cannot read the IC roll-up they have access to via _accessible_deal elsewhere. Should call _accessible_deal.",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "GET /api/documents/{doc_id}/file",
+        "issue": "Also filters by user_id (line 631). PDF file viewing broken for org members on shared deals.",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "GET /api/search",
+        "issue": "Filters deals/documents/red_flags by user_id (lines 567,576,587). Org members searching from a shared deal's org cannot find content. Should scope to _user_org_ids().",
+        "priority": "HIGH"
+      },
+      {
+        "endpoint": "GET /api/dashboard/stats",
+        "issue": "Counts use {user_id: user_id} (lines 203-211). Inconsistent with /api/deals (now org-scoped). Dashboard numbers will be wrong for any user who is part of a multi-seat org — they will not see counts for deals/documents created by teammates.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "models.Document",
+        "issue": "Class is missing an org_id field entirely (models.py shows org_id only on Deal, Organization, OrgMember, OrgInvite). Even if upload_document is patched to write org_id, the Pydantic model won't round-trip it. Add org_id: Optional[str] = None to Document and set it explicitly in upload_document = deal_raw.get('org_id')."
+      },
+      {
+        "endpoint": "POST /api/orgs/current/invites",
+        "issue": "Owner can invite their OWN email — there is no self-invite guard. The subsequent member-already-exists check fires only if a row already exists in org_members for that user, but if A invites A@... it will pass and create a useless pending invite. Cosmetic."
+      },
+      {
+        "endpoint": "POST /api/webhook/stripe (replay path)",
+        "issue": "Replay protection logic looks correct on read but could not be exercised end-to-end without valid Stripe signatures — happy path verified only by code review. Invalid-body path correctly returns 400 (not 500)."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_orgs_iteration4.py",
+    "/app/test_reports/pytest/iteration4.xml",
+    "/app/backend/tests/backend_test.py",
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/test_billing_share_slack.py"
+  ],
+  "action_items": [
+    "Add `org_id: Optional[str] = None` to Document in models.py and set document.org_id = deal_raw.get('org_id') inside upload_document before insert.",
+    "Refactor GET /api/documents/{id}, DELETE /api/documents/{id}, GET /api/documents/{id}/file to use a new helper _accessible_document(doc_id, user_id) that joins doc.deal_id → _accessible_deal.",
+    "Refactor GET /api/deals/{id}/rollup to use _accessible_deal (currently still user_id-scoped).",
+    "Scope /api/search and /api/dashboard/stats to _user_org_ids() instead of user_id for consistency with /api/deals and the org refactor intent.",
+    "(Optional) Backfill org_id on existing documents on next login via _ensure_user_org (currently only backfills when current_org_id is missing — legacy docs with org_id=None on already-provisioned users will never be migrated). Run a one-off migration: db.documents.updateMany({org_id:{$in:[null,undefined]}}, [{$set:{org_id:'$$REMOVE'}}, … with $lookup … ]) or write a python script.",
+    "(Optional) Add self-invite guard to POST /api/orgs/current/invites."
+  ],
+  "critical_code_review_comments": [
+    "server.py:357 upload_document never persists org_id on the Document. This is the root cause of /api/activity/recent returning []. Plus the Document Pydantic model has no org_id field at all.",
+    "server.py:408,415,631 — GET/DELETE/file routes for /api/documents/{id} use {_id, user_id} filters. Inconsistent with the org-scoped Deal access path (_accessible_deal). Org members get 404 on docs they should be able to read.",
+    "server.py:550 get_rollup uses user_id filter — leftover from pre-refactor. Should call _accessible_deal(deal_id, user_id).",
+    "server.py:565-602 global_search still per-user. Should expand to _user_org_ids() to surface shared-org content.",
+    "server.py:203-211 dashboard_stats still per-user. Inconsistent with /api/deals which lists across all member orgs.",
+    "server.py:81-120 _ensure_user_org backfills deals AND documents on the very first call (good), but it short-circuits if user already has current_org_id. So any pre-existing docs created AFTER current_org_id was set (i.e. the regression window) will never be backfilled. A one-shot data migration is needed in addition to fixing upload_document.",
+    "server.py:1083-1095 — invite idempotency revokes prior invites for the SAME email+org. Good. But there is no rate-limit / cooldown; an owner could spam invites against any email.",
+    "server.py:1158-1184 accept_invite: case-insensitive email compare (good). Updates current_org_id to new org (good). Race condition: two concurrent accepts could insert two org_members rows; the `if not already:` guard helps but is not atomic.",
+    "server.py:1188-1226 update_member / remove_member correctly block owner self-demotion/removal and re-provision a personal org for the removed user. Logic is sound.",
+    "server.py:954-1003 stripe_webhook replay protection: handle_webhook(body, sig) is called BEFORE the dedup check, so an attacker who replays a *valid* signed event will pass verification — then the event_id lookup catches it. Order is correct (must verify before trusting event_id). Returns {ok:true, replayed:true} on dup. Good.",
+    "server.py:685-692 _share_expired: timezone-aware compare via .replace('Z','+00:00') + datetime.now(timezone.utc). Verified by DB-backdated test — meta returns 410 and view returns 410. Good.",
+    "server.py:716-746 create_share idempotency: returns existing token only when (expires_at == new_expires_at) AND (has_password == new_has_password). Note this means re-posting with the SAME password string still returns the same token (because we only compare existence). Verified."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_orgs_iteration4.py (new — 40 tests in 9 classes)"
+  ],
+  "success_rate": {
+    "backend": "139/140 (99.3%) — 40/40 new iteration-4 tests pass; 1 regression in backend_test.py::test_recent_activity",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "Per-run users: orgs_a_<hex>@clearvault.io, orgs_b_<hex>@clearvault.io, orgs_c_<hex>@clearvault.io, share_owner_<hex>@clearvault.io — all password Vault123!. Cleaned up in module teardown.",
+  "seed_data_creation": "Per-run: 4 fresh users, 2 deals (one of which has a rollup injected directly into Mongo for share testing), multiple invites (some revoked, one accepted), multiple shares (with/without expiry, with/without password, one DB-backdated to past). All deleted in teardown by deleting users + their deals/documents/shares/org_members/organizations/org_invites.",
+  "retest_needed": true,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Four pytest files now cover the backend: backend_test.py (26), test_new_features.py (34), test_billing_share_slack.py (40), test_orgs_iteration4.py (40) = 140 tests total. Run all with `REACT_APP_BACKEND_URL=https://ui-build-showcase.preview.emergentagent.com MONGO_URL=mongodb://localhost:27017 DB_NAME=test_database pytest /app/backend/tests/ -v`. iteration_4 file requires direct Mongo access (pymongo) for the expired-share backdating test and for fast user-cleanup — both MONGO_URL and DB_NAME must be set in the shell. The single regression (test_recent_activity) is NOT a flaky test; it is exposing a real product bug (documents not assigned org_id) — DO NOT mask it.",
+  "rca of the issue": "Org refactor introduced a Deal.org_id field and migrated all deal-level queries to use _user_org_ids(). However, Document was NOT migrated: (a) Document model has no org_id field, (b) upload_document does not write any org_id, (c) several document/search/stats/rollup endpoints still filter by {user_id: user_id}. The net result is two classes of bug: (1) /api/activity/recent silently returns [] for everyone because it queries by org_id which is always None on documents; (2) org members are denied access (404) to documents/rollups/search/stats for deals their org owns, breaking the multi-seat promise. Reproduction: signup user, upload a PDF, GET /api/activity/recent → []. Reproduction 2: A invites B, B accepts, A uploads doc, B GET /api/documents/{id} → 404. Mitigation: (a) add org_id to Document model + persist it in upload_document from the parent deal's org_id; (b) replace user_id filters in document endpoints with _accessible_document/_accessible_deal helpers; (c) widen search/stats to _user_org_ids; (d) one-off backfill: db.documents.aggregate to lookup each doc's deal.org_id and $set."
+}

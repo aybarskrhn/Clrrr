@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import api from "@/lib/api";
-import { AlertOctagon, Loader2, FileText, ShieldCheck } from "lucide-react";
+import { AlertOctagon, Loader2, FileText, ShieldCheck, Lock, ArrowRight } from "lucide-react";
 
 function SeverityChip({ s }) {
   const k = (s || "").toLowerCase();
@@ -14,46 +14,136 @@ function SeverityChip({ s }) {
 
 export default function ShareView() {
   const { token } = useParams();
+  const [meta, setMeta] = useState(null);
   const [data, setData] = useState(null);
   const [err, setErr] = useState(null);
+  const [password, setPassword] = useState("");
+  const [unlocking, setUnlocking] = useState(false);
+  const [pwError, setPwError] = useState("");
 
+  // Step 1: load metadata (tells us if password is required)
   useEffect(() => {
     let live = true;
     api
-      .get(`/share/${token}`)
-      .then(({ data }) => live && setData(data))
+      .get(`/share/${token}/meta`)
+      .then(({ data }) => live && setMeta(data))
       .catch((e) => live && setErr(e?.response?.data?.detail || "Memo not found"));
     return () => {
       live = false;
     };
   }, [token]);
 
+  // Step 2: if no password required, load the memo directly
+  useEffect(() => {
+    if (!meta || meta.has_password || data) return;
+    api
+      .get(`/share/${token}`)
+      .then(({ data }) => setData(data))
+      .catch((e) => setErr(e?.response?.data?.detail || "Memo not found"));
+  }, [meta, token, data]);
+
+  const unlock = async (e) => {
+    e?.preventDefault();
+    setUnlocking(true);
+    setPwError("");
+    try {
+      const { data } = await api.post(`/share/${token}/unlock`, { password });
+      setData(data);
+    } catch (e) {
+      setPwError(e?.response?.data?.detail || "Wrong password");
+    } finally {
+      setUnlocking(false);
+    }
+  };
+
   if (err) {
     return (
-      <div className="min-h-screen bg-[var(--cv-bg)] text-[var(--cv-text)]">
-        <div className="mx-auto flex max-w-2xl flex-col items-start px-8 py-24">
-          <div className="flex items-center gap-2 text-[var(--cv-danger)]">
-            <AlertOctagon className="h-5 w-5" />
-            <span className="font-mono text-[11px] uppercase tracking-widest">Memo unavailable</span>
-          </div>
-          <h1 className="mt-3 font-heading text-3xl font-bold tracking-tight">{err}</h1>
-          <p className="mt-3 font-body text-sm text-[var(--cv-muted)]">
-            The owner may have revoked this link or removed the underlying analysis.
-          </p>
+      <Shell>
+        <div className="flex items-center gap-2 text-[var(--cv-danger)]">
+          <AlertOctagon className="h-5 w-5" />
+          <span className="font-mono text-[11px] uppercase tracking-widest">Memo unavailable</span>
         </div>
-      </div>
+        <h1 className="mt-3 font-heading text-3xl font-bold tracking-tight">{err}</h1>
+        <p className="mt-3 font-body text-sm text-[var(--cv-muted)]">
+          The owner may have revoked this link, set an expiry that has passed, or removed the
+          underlying analysis.
+        </p>
+      </Shell>
+    );
+  }
+
+  if (!meta) {
+    return (
+      <Shell>
+        <div className="flex items-center gap-2 font-mono text-sm text-[var(--cv-muted)]">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading shared memo…
+        </div>
+      </Shell>
+    );
+  }
+
+  // Password gate
+  if (meta.has_password && !data) {
+    return (
+      <Shell>
+        <div className="cv-tag">// PROTECTED MEMO</div>
+        <h1 className="mt-3 font-heading text-3xl font-bold tracking-tight md:text-4xl">
+          {meta.deal_name}
+        </h1>
+        <p className="mt-2 font-body text-sm text-[var(--cv-muted)]">
+          Target · <span className="text-[var(--cv-text)]">{meta.target_company}</span>
+        </p>
+        {meta.expires_at && (
+          <p className="mt-1 font-mono text-[11px] text-[var(--cv-muted)]">
+            link expires{" "}
+            <span className="text-[var(--cv-text)]">{meta.expires_at.slice(0, 10)}</span>
+          </p>
+        )}
+
+        <form onSubmit={unlock} data-testid="share-unlock-form" className="mt-8">
+          <label className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-widest text-[var(--cv-primary)]">
+            <Lock className="h-3.5 w-3.5" /> Password required
+          </label>
+          <input
+            type="password"
+            required
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+            data-testid="share-unlock-password"
+            placeholder="enter password…"
+            className="mt-3 w-full border border-[var(--cv-border)] bg-[var(--cv-bg)] px-3 py-2.5 font-mono text-sm outline-none focus:border-[var(--cv-primary)]"
+          />
+          {pwError && (
+            <p data-testid="share-unlock-error" className="mt-2 font-mono text-xs text-[var(--cv-danger)]">
+              {pwError}
+            </p>
+          )}
+          <button
+            type="submit"
+            disabled={unlocking}
+            data-testid="share-unlock-submit"
+            className="mt-5 flex items-center gap-2 bg-[var(--cv-primary)] px-4 py-2.5 font-mono text-xs font-semibold uppercase tracking-widest text-black hover:bg-[var(--cv-primary-hover)] disabled:opacity-60"
+          >
+            {unlocking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowRight className="h-3.5 w-3.5" />}
+            Unlock memo
+          </button>
+        </form>
+      </Shell>
     );
   }
 
   if (!data) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-[var(--cv-bg)] font-mono text-sm text-[var(--cv-muted)]">
-        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Loading shared memo…
-      </div>
+      <Shell>
+        <div className="flex items-center gap-2 font-mono text-sm text-[var(--cv-muted)]">
+          <Loader2 className="h-4 w-4 animate-spin" /> Loading…
+        </div>
+      </Shell>
     );
   }
 
-  const { deal, rollup, rollup_at, view_count } = data;
+  const { deal, rollup, rollup_at, view_count, expires_at } = data;
   const recColor = (r) => (r === "proceed" ? "cv-chip-green" : r === "pass" ? "cv-chip-red" : "cv-chip-amber");
 
   return (
@@ -68,6 +158,9 @@ export default function ShareView() {
               CLEAR<span className="text-[var(--cv-primary)]">VAULT</span>
             </span>
             <span className="cv-chip cv-chip-amber ml-2">SHARED · READ-ONLY</span>
+            {expires_at && (
+              <span className="cv-chip ml-1">expires {expires_at.slice(0, 10)}</span>
+            )}
           </div>
           <a
             href="/"
@@ -102,7 +195,6 @@ export default function ShareView() {
           </p>
         </div>
 
-        {/* Recommendation */}
         <section className="mt-6 border border-[var(--cv-border)] bg-[var(--cv-surface)] p-6">
           <div className="flex items-center justify-between">
             <span className="font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
@@ -120,7 +212,6 @@ export default function ShareView() {
           )}
         </section>
 
-        {/* Consolidated financials */}
         {rollup.consolidated_financials?.length > 0 && (
           <section className="mt-4 border border-[var(--cv-border)] bg-[var(--cv-surface)]">
             <div className="border-b border-[var(--cv-border)] px-4 py-3 font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
@@ -149,7 +240,6 @@ export default function ShareView() {
           </section>
         )}
 
-        {/* Top red flags */}
         {rollup.top_red_flags?.length > 0 && (
           <section className="mt-4 border border-[var(--cv-border)] bg-[var(--cv-surface)]">
             <div className="border-b border-[var(--cv-border)] px-4 py-3 font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
@@ -177,7 +267,6 @@ export default function ShareView() {
           </section>
         )}
 
-        {/* Gaps + next steps */}
         <section className="mt-4 grid grid-cols-1 gap-4 md:grid-cols-2">
           {rollup.diligence_gaps?.length > 0 && (
             <div className="border border-[var(--cv-border)] bg-[var(--cv-surface)] p-5">
@@ -224,6 +313,25 @@ export default function ShareView() {
           </a>
         </footer>
       </main>
+    </div>
+  );
+}
+
+function Shell({ children }) {
+  return (
+    <div className="min-h-screen bg-[var(--cv-bg)] text-[var(--cv-text)] cv-grid-bg">
+      <div className="cv-scanlines absolute inset-0 pointer-events-none" />
+      <div className="relative mx-auto max-w-2xl px-6 py-16">
+        <a href="/" className="flex w-fit items-center gap-3">
+          <div className="flex h-7 w-7 items-center justify-center border border-[var(--cv-primary)] bg-[var(--cv-primary)] text-black">
+            <span className="font-mono text-sm font-bold">CV</span>
+          </div>
+          <span className="font-heading text-base font-bold tracking-tight">
+            CLEAR<span className="text-[var(--cv-primary)]">VAULT</span>
+          </span>
+        </a>
+        <div className="mt-10 border border-[var(--cv-border)] bg-[var(--cv-surface)] p-8">{children}</div>
+      </div>
     </div>
   );
 }

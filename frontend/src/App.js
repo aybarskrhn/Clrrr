@@ -14,6 +14,8 @@ import Settings from "@/pages/Settings";
 import BillingSuccess from "@/pages/BillingSuccess";
 import BillingCancel from "@/pages/BillingCancel";
 import ShareView from "@/pages/ShareView";
+import Team from "@/pages/Team";
+import AcceptInvite from "@/pages/AcceptInvite";
 
 function Protected({ children }) {
   const { user, loading } = useAuth();
@@ -97,6 +99,15 @@ function App() {
                 </Protected>
               }
             />
+            <Route
+              path="/team"
+              element={
+                <Protected>
+                  <Team />
+                </Protected>
+              }
+            />
+            <Route path="/invite/:token" element={<AcceptInvite />} />
             <Route
               path="/billing/success"
               element={

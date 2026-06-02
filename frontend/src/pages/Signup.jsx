@@ -11,7 +11,14 @@ export default function Signup() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const next = params.get("next");
-  const [form, setForm] = useState({ name: "", firm: "", email: "", password: "" });
+  const inviteToken = params.get("invite");
+  const inviteEmail = params.get("email");
+  const [form, setForm] = useState({
+    name: "",
+    firm: "",
+    email: inviteEmail || "",
+    password: "",
+  });
   const [loading, setLoading] = useState(false);
 
   const onChange = (k) => (e) => setForm({ ...form, [k]: e.target.value });
@@ -22,6 +29,19 @@ export default function Signup() {
     try {
       await signup(form);
       toast.success("Terminal provisioned.");
+
+      // If signing up via an invite link, accept it
+      if (inviteToken) {
+        try {
+          await api.post(`/invites/${inviteToken}/accept`);
+          toast.success("Joined workspace.");
+        } catch (err) {
+          // non-fatal — they can accept from /invite/:token later
+        }
+        navigate("/dashboard");
+        return;
+      }
+
       if (next === "upgrade") {
         try {
           const { data } = await api.post("/payments/checkout/session", {

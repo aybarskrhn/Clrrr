@@ -51,6 +51,7 @@ class User(BaseDocument):
     plan: str = "trial"  # trial | desk | firm
     plan_active_until: Optional[str] = None
     slack_webhook_url: Optional[str] = None
+    current_org_id: Optional[str] = None
     created_at: str = Field(default_factory=now_iso)
 
 
@@ -63,6 +64,7 @@ class UserPublic(BaseModel):
     plan: str = "trial"
     plan_active_until: Optional[str] = None
     slack_webhook_url: Optional[str] = None
+    current_org_id: Optional[str] = None
     created_at: str
 
 
@@ -85,7 +87,8 @@ class AuthResponse(BaseModel):
 
 # ---------- Deal ----------
 class Deal(BaseDocument):
-    user_id: str
+    user_id: str  # original creator
+    org_id: Optional[str] = None  # owning organization
     name: str
     target_company: str
     sector: str = "Industrials"
@@ -96,6 +99,32 @@ class Deal(BaseDocument):
     rollup_at: Optional[str] = None
     created_at: str = Field(default_factory=now_iso)
     updated_at: str = Field(default_factory=now_iso)
+
+
+# ---------- Organization ----------
+class Organization(BaseDocument):
+    name: str
+    owner_id: str
+    plan: str = "trial"
+    plan_active_until: Optional[str] = None
+    created_at: str = Field(default_factory=now_iso)
+
+
+class OrgMember(BaseDocument):
+    org_id: str
+    user_id: str
+    role: str = "member"  # owner | admin | member
+    joined_at: str = Field(default_factory=now_iso)
+
+
+class OrgInvite(BaseDocument):
+    org_id: str
+    email: EmailStr
+    role: str = "member"
+    invited_by: str
+    accepted_at: Optional[str] = None
+    revoked: bool = False
+    created_at: str = Field(default_factory=now_iso)
 
 
 class DealCreate(BaseModel):
