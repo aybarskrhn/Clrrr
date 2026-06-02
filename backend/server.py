@@ -122,14 +122,23 @@ async def _ensure_user_org(user_id: str) -> str:
 
 async def _backfill_missing_doc_org_ids(user_id: str) -> None:
     """One-shot backfill: any document owned by this user with no org_id gets its parent deal's org_id."""
+    # Skip if already backfilled (set a flag on the user record after first clean pass)
+    flag = await db.users.find_one({"_id": user_id}, {"docs_backfilled": 1})
+    if flag and flag.get("docs_backfilled"):
+        return
     cursor = db.documents.find({
         "user_id": user_id,
         "$or": [{"org_id": None}, {"org_id": {"$exists": False}}],
     })
+    found_any = False
     async for d in cursor:
+        found_any = True
         deal = await db.deals.find_one({"_id": d.get("deal_id")})
         if deal and deal.get("org_id"):
             await db.documents.update_one({"_id": d["_id"]}, {"$set": {"org_id": deal["org_id"]}})
+    # Mark backfilled when there's nothing left to migrate — subsequent calls are cheap no-ops
+    if not found_any:
+        await db.users.update_one({"_id": user_id}, {"$set": {"docs_backfilled": True}})
 
 
 async def _user_org_ids(user_id: str) -> List[str]:
