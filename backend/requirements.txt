@@ -85,6 +85,7 @@ pyflakes==3.4.0
 Pygments==2.20.0
 PyJWT==2.13.0
 pymongo==4.5.0
+PyMuPDF==1.27.2.3
 pyparsing==3.3.2
 pypdf==6.12.2
 pytest==9.0.3
@@ -96,6 +97,7 @@ pytokens==0.4.1
 PyYAML==6.0.3
 referencing==0.37.0
 regex==2026.5.9
+reportlab==4.5.1
 requests==2.34.2
 requests-oauthlib==2.0.0
 rich==15.0.0

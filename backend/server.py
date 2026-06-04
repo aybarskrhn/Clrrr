@@ -21,6 +21,17 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 from ai_service import extract_pdf, summarize_deal  # noqa: E402
+from analysis_pipeline import (  # noqa: E402
+    answer_with_citations,
+    markdown_table_to_csv,
+    retrieve_chunks,
+)
+from extractor import (  # noqa: E402
+    extract_page_text,
+    page_count as pdf_page_count,
+    render_page_with_highlights,
+    render_thumbnail,
+)
 from auth import create_token, decode_token, get_current_user_id, hash_password, verify_password  # noqa: E402
 from emergentintegrations.payments.stripe.checkout import CheckoutSessionRequest  # noqa: E402
 from payments import PACKAGES, get_package, make_checkout  # noqa: E402
@@ -1290,6 +1301,170 @@ async def switch_org(org_id: str, user_id: str = Depends(get_current_user_id)):
 
 
 app.include_router(api)
+
+# =============================================================
+# Analysis Terminal · CSV Export · Highlighting & Provenance
+# (Core Backend Integration blueprint — Features 1, 2, 3)
+# =============================================================
+import base64 as _b64
+
+ANALYZE_ROUTER = APIRouter(prefix="/api")
+
+
+class AnalyzeRequest(BaseModel):
+    question: str
+    doc_scope: List[str]
+    n_results: int = 2
+
+
+class ExportTableRequest(BaseModel):
+    answer: str
+    row_pages: Optional[List[Optional[int]]] = None
+    row_docs: Optional[List[Optional[str]]] = None
+    row_reasoning: Optional[List[str]] = None
+
+
+class HighlightRequest(BaseModel):
+    doc_name: str
+    page_num: int
+    search_terms: List[str] = []
+
+
+class PageTextRequest(BaseModel):
+    doc_name: str
+    page_num: int
+
+
+async def _resolve_scope_docs(doc_ids: List[str], user_id: str) -> list[dict]:
+    org_ids = await _user_org_ids(user_id)
+    out: list[dict] = []
+    for did in doc_ids:
+        raw = await db.documents.find_one({"_id": did})
+        if not raw:
+            continue
+        if raw.get("org_id") in org_ids:
+            ok = True
+        else:
+            deal = await db.deals.find_one({"_id": raw.get("deal_id")})
+            ok = bool(deal and deal.get("org_id") in org_ids)
+        if not ok:
+            continue
+        out.append({"doc_name": did, "pdf_path": raw.get("file_path", "")})
+    return out
+
+
+@ANALYZE_ROUTER.post("/analyze")
+async def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_id)):
+    if not req.question or not req.question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+    if not req.doc_scope:
+        raise HTTPException(status_code=400, detail="doc_scope must contain at least one document id")
+
+    docs = await _resolve_scope_docs(req.doc_scope, user_id)
+    if not docs:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "No relevant pages found.", "cited_pages": [], "is_verified": False},
+        )
+
+    try:
+        chunks = retrieve_chunks(req.question, docs, n_results=max(1, req.n_results))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("retrieve_chunks failed")
+        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}")
+
+    if not chunks:
+        return JSONResponse(
+            status_code=422,
+            content={"error": "No relevant pages found.", "cited_pages": [], "is_verified": False},
+        )
+
+    try:
+        result = answer_with_citations(req.question, chunks, doc_filter=req.doc_scope)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("answer_with_citations failed")
+        raise HTTPException(status_code=502, detail=f"OpenRouter call failed: {exc}")
+
+    result.pop("source_chunks", None)
+    return result
+
+
+@ANALYZE_ROUTER.post("/export-table")
+async def export_table(req: ExportTableRequest, user_id: str = Depends(get_current_user_id)):
+    from provenance import extract_table_from_answer as _xt
+
+    table_md = _xt(req.answer or "")
+    if not table_md:
+        raise HTTPException(status_code=400, detail="No Markdown table found in answer")
+
+    csv_data = markdown_table_to_csv(
+        table_md,
+        row_pages=req.row_pages,
+        row_docs=req.row_docs,
+        row_reasoning=req.row_reasoning,
+    )
+    if not csv_data:
+        raise HTTPException(status_code=500, detail="CSV serialization produced empty output")
+
+    first_page = next((p for p in (req.row_pages or []) if isinstance(p, int)), None)
+    filename = f"table_p{first_page}.csv" if first_page is not None else "table.csv"
+    row_count = max(0, csv_data.count("\n") - 1)
+    has_unresolved = "Unresolved" in csv_data
+    return {
+        "csv_data": csv_data,
+        "filename": filename,
+        "row_count": row_count,
+        "has_unresolved": has_unresolved,
+    }
+
+
+async def _authorized_doc_pdf(doc_id: str, user_id: str) -> tuple[str, str]:
+    raw = await _accessible_document(doc_id, user_id)
+    return raw.get("file_path", ""), raw.get("filename", doc_id)
+
+
+@ANALYZE_ROUTER.post("/highlight-page")
+async def highlight_page(req: HighlightRequest, user_id: str = Depends(get_current_user_id)):
+    pdf_path, _filename = await _authorized_doc_pdf(req.doc_name, user_id)
+    if not pdf_path:
+        raise HTTPException(status_code=404, detail="Document file not available")
+    png, quads = render_page_with_highlights(pdf_path, req.page_num, req.search_terms)
+    if not png:
+        return {"page_png_b64": "", "quad_count": 0, "page_num": req.page_num, "doc_name": req.doc_name}
+    return {
+        "page_png_b64": _b64.b64encode(png).decode("ascii"),
+        "quad_count": quads,
+        "page_num": req.page_num,
+        "doc_name": req.doc_name,
+    }
+
+
+@ANALYZE_ROUTER.post("/highlight-thumbnail")
+async def highlight_thumbnail(req: HighlightRequest, user_id: str = Depends(get_current_user_id)):
+    pdf_path, _filename = await _authorized_doc_pdf(req.doc_name, user_id)
+    if not pdf_path:
+        raise HTTPException(status_code=404, detail="Document file not available")
+    png = render_thumbnail(pdf_path, req.page_num, req.search_terms)
+    return {
+        "thumbnail_png_b64": _b64.b64encode(png).decode("ascii") if png else "",
+        "page_num": req.page_num,
+    }
+
+
+@ANALYZE_ROUTER.post("/page-text")
+async def page_text(req: PageTextRequest, user_id: str = Depends(get_current_user_id)):
+    pdf_path, _filename = await _authorized_doc_pdf(req.doc_name, user_id)
+    if not pdf_path:
+        raise HTTPException(status_code=404, detail="Document file not available")
+    text = extract_page_text(pdf_path, req.page_num)
+    return {
+        "text": text or "",
+        "has_text_layer": bool(text and text.strip()),
+        "page_count": pdf_page_count(pdf_path),
+    }
+
+
+app.include_router(ANALYZE_ROUTER)
 
 app.add_middleware(
     CORSMiddleware,

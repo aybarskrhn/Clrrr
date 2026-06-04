@@ -20,7 +20,9 @@ import {
   Share2,
   Copy,
   X,
+  TerminalSquare,
 } from "lucide-react";
+import AnalysisTerminal from "@/components/AnalysisTerminal";
 
 function StatusChip({ status }) {
   if (status === "completed")
@@ -61,6 +63,7 @@ function SeverityChip({ s }) {
 
 const TABS = [
   { key: "overview", label: "Overview", icon: LayoutGrid },
+  { key: "analyze", label: "Analysis Terminal", icon: TerminalSquare },
   { key: "preview", label: "PDF preview", icon: FileSearch },
   { key: "rollup", label: "IC roll-up", icon: Sparkles },
 ];
@@ -296,6 +299,8 @@ export default function DealDetail() {
         {tab === "preview" && (
           <PreviewTab docs={docs} selected={selected} setSelected={setSelected} ex={ex} />
         )}
+
+        {tab === "analyze" && <AnalysisTerminal deal={deal} documents={docs} />}
 
         {tab === "rollup" && (
           <RollupTab

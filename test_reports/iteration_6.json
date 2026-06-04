@@ -1,0 +1,44 @@
+{
+  "summary": "Iteration 6 — Core Backend Integration blueprint (Analysis Terminal + Causality Engine + Highlighting Engine) tested live against OpenRouter (claude-sonnet-4.6). Added /app/backend/tests/test_analyze_pipeline.py with 26 tests covering all 5 new endpoints + _numeric_variants unit cases + numeric-variant E2E matching. New tests: 26/26 PASS. Full regression across all 6 backend test files: 183/184 PASS (99.5%). One pre-existing iteration-5 test (TestLegacyDocBackfill.test_legacy_doc_gets_backfilled_org_id) regressed because the main agent applied the cosmetic optimization recommended in iter5 (user.docs_backfilled one-shot flag) which short-circuits backfill after the first clean pass — benign in production (uploads set org_id at write time) but defeats the test's raw-mongo legacy-doc insertion. Live OpenRouter calls used: 2 (1 text PDF analyze + 1 image PDF analyze). All 5 new endpoints conform to the blueprint contract exactly including highlight_terms_by_page being string-keyed.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "/api/activity/recent (and any endpoint that calls _user_org_ids)",
+        "issue": "_backfill_missing_doc_org_ids now exits early when user.docs_backfilled=true (added between iter5 and iter6 per cosmetic review note). This breaks iteration-5 regression test TestLegacyDocBackfill.test_legacy_doc_gets_backfilled_org_id which inserts a legacy doc via raw mongo AFTER the flag has been set by the first user activity. Production impact: NONE — real uploads go through upload_document which writes org_id at write time. Fix options: (a) update the iter5 test to unset docs_backfilled before inserting the legacy doc; (b) invalidate the flag whenever a doc is inserted without org_id; or (c) drop the flag and accept the per-request scan cost since once all real docs have org_id it's effectively a no-op cursor. Option (a) is cheapest."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_analyze_pipeline.py",
+    "/app/test_reports/pytest/iteration6_analyze.xml",
+    "/app/test_reports/pytest/iteration6_full.xml"
+  ],
+  "action_items": [
+    "(MINOR) Reconcile docs_backfilled flag with TestLegacyDocBackfill — easiest fix is to db.users.update_one({'_id': a_id}, {'$unset': {'docs_backfilled': ''}}) inside that test BEFORE inserting the legacy doc, then trigger any org-scoped endpoint."
+  ],
+  "critical_code_review_comments": [
+    "server.py is now 1480 lines — comfortably under the 700-line soft cap warning will trigger if it grows much more; the ANALYZE_ROUTER section (lines 1306–1467) is a natural module boundary and should be extracted to /app/backend/routers/analyze.py to keep server.py focused on auth/deals/docs. Cosmetic.",
+    "/api/analyze swallows OpenRouter errors as HTTPException(502, ...) which is correct, but the upstream error message is concatenated into detail verbatim — sensitive (API key prefix, internal URLs) could leak. Recommend logger.exception + a generic 502 'Analysis service unavailable' to clients.",
+    "_resolve_scope_docs (server.py:1338) only filters by raw['org_id'] OR parent deal['org_id'] ∈ user orgs, but does NOT auto-backfill the document's org_id when only the deal lookup succeeds. Functionally fine for /api/analyze but inconsistent with _accessible_document which DOES backfill in-line. Cosmetic.",
+    "/api/highlight-page returns 200 with empty page_png_b64 when render fails (line 1432) — should probably be 500. Caller now has to differentiate between 'page valid, 0 highlights' (quad_count=0, png present) and 'render failed' (png empty) by checking length. Documented as expected behaviour in the review request but worth a small contract tightening.",
+    "AnalyzeRequest has no max-length on `question` and no upper bound on len(doc_scope) — a hostile client could pass thousands of doc IDs and trigger N Mongo lookups + N PyMuPDF opens. Recommend Pydantic Field constraints (max_length on question, max_items on doc_scope).",
+    "MAX_IMAGES_PER_CALL is read from env at module import time only — changing the value requires a backend restart. Minor.",
+    "extractor.render_page_with_highlights mutates the loaded PyMuPDF Document in-memory by adding highlight annotations before rendering — fine because the doc context-manager doesn't save back to disk, but worth a comment that this is non-persistent.",
+    "provenance._numeric_variants now correctly handles $4.2M, ($1,234), $5.00 — verified via dedicated unit tests in test_analyze_pipeline.py::TestNumericVariants (5/5)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_analyze_pipeline.py (NEW — 26 tests in 8 classes covering 5 endpoints + unit + E2E)"
+  ],
+  "success_rate": {
+    "backend": "183/184 (99.5%) — 26 new analyze-pipeline tests all green; 1 pre-existing iter5 test regressed (see minor issue above)",
+    "frontend": "not tested (backend-only request)"
+  },
+  "test_credentials": "Per-run users: i6a_<hex>@clearvault.io, i6b_<hex>@clearvault.io (Vault123!).",
+  "seed_data_creation": "Per-run: 2 fresh users (A owner, B outsider), 1 deal owned by A, 2 PDF uploads (one text-layer with depreciation values, one image-only via reportlab drawImage). All cleaned up in module teardown.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend now has 6 pytest files (184 tests total). Run with `REACT_APP_BACKEND_URL=https://ui-build-showcase.preview.emergentagent.com MONGO_URL=mongodb://localhost:27017 DB_NAME=test_database pytest /app/backend/tests/ -v` (~2m20s). The /api/analyze endpoint is the only test that calls OpenRouter live — test_analyze_pipeline.py is parametrised to use at most 2 live calls per run. The image-only PDF test gracefully handles both 200 (with unverified markers) and 422 (CPU retrieval found no tokens) outcomes since the text layer is genuinely empty. ALL 5 new endpoint contracts match the blueprint exactly: AnalyzeRequest{question,doc_scope,n_results}, ExportTableRequest{answer,row_pages?,row_docs?,row_reasoning?}, HighlightRequest{doc_name,page_num,search_terms[]}, PageTextRequest{doc_name,page_num}. highlight_terms_by_page IS string-keyed as documented.",
+  "rca of the issue": "TestLegacyDocBackfill regression cause: server.py:134 _backfill_missing_doc_org_ids early-exits when user.docs_backfilled flag is true. The flag is set on line 152 whenever found_any==False (i.e., a clean scan). User A's first endpoint call after upload finds no missing docs (uploads set org_id correctly), so the flag is set. The iter5 test then inserts a legacy doc via raw mongo, but subsequent _user_org_ids calls now short-circuit and never run the cursor. The flag is a valid prod optimization but is semantically incompatible with retroactive raw-mongo inserts. Mitigation in test: clear the flag before legacy insert: `db.users.update_one({'_id': state['a_id']}, {'$unset': {'docs_backfilled': ''}})`. Mitigation in code (more defensive): invalidate the flag in any code path that writes a document without org_id, or simply drop the optimization since the cursor is empty in steady state."
+}
