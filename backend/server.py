@@ -3,11 +3,12 @@ import csv
 import io
 import logging
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
@@ -20,12 +21,13 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-from ai_service import extract_pdf, summarize_deal  # noqa: E402
+from ai_service import answer_question_with_pdf, extract_pdf, summarize_deal  # noqa: E402
 from analysis_pipeline import (  # noqa: E402
-    answer_with_citations,
+    _extract_row_reasoning,
+    answer_with_citations,  # noqa: F401  (kept for backwards-compat / future use)
     markdown_table_to_csv,
-    retrieve_chunks,
 )
+from provenance import extract_table_from_answer, resolve_table_provenance  # noqa: E402
 from extractor import (  # noqa: E402
     extract_page_text,
     page_count as pdf_page_count,
@@ -1367,26 +1369,114 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_i
             content={"error": "No relevant pages found.", "cited_pages": [], "is_verified": False},
         )
 
-    try:
-        chunks = retrieve_chunks(req.question, docs, n_results=max(1, req.n_results))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("retrieve_chunks failed")
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}")
+    # Resolve each doc's local file path and assign a short label (1, 2, 3, ...).
+    pdf_paths: List[str] = []
+    doc_labels: List[str] = []
+    label_to_doc: Dict[str, str] = {}
+    for idx, d in enumerate(docs, start=1):
+        path = (d.get("pdf_path") or "").strip()
+        if not path or not Path(path).is_file():
+            logger.warning("analyze: skipping doc %s missing file %s", d.get("doc_name"), path)
+            continue
+        label = str(idx)
+        pdf_paths.append(path)
+        doc_labels.append(label)
+        label_to_doc[label] = d["doc_name"]
 
-    if not chunks:
+    if not pdf_paths:
         return JSONResponse(
             status_code=422,
-            content={"error": "No relevant pages found.", "cited_pages": [], "is_verified": False},
+            content={"error": "Document files not found on server.", "cited_pages": [], "is_verified": False},
         )
 
-    try:
-        result = answer_with_citations(req.question, chunks, doc_filter=req.doc_scope)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("answer_with_citations failed")
-        raise HTTPException(status_code=502, detail=f"OpenRouter call failed: {exc}")
+    # Build minimal deal context (best-effort)
+    deal_ctx: Optional[str] = None
+    first_raw = await db.documents.find_one({"_id": docs[0]["doc_name"]})
+    if first_raw and first_raw.get("deal_id"):
+        deal = await db.deals.find_one({"_id": first_raw["deal_id"]})
+        if deal:
+            deal_ctx = (
+                f"Deal: {deal.get('name', '')}\n"
+                f"Target: {deal.get('target_company', '')}\n"
+                f"Sector: {deal.get('sector', '')}"
+            )
 
-    result.pop("source_chunks", None)
-    return result
+    try:
+        answer = await answer_question_with_pdf(
+            req.question, pdf_paths, context=deal_ctx, doc_labels=doc_labels
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("answer_question_with_pdf failed")
+        raise HTTPException(status_code=502, detail=f"Gemini call failed: {exc}")
+
+    # Parse `[Doc <label> · p.N]` citations from the answer text.
+    citation_re = re.compile(r"\[Doc\s+([A-Za-z0-9_\-]+)\s*[·\.\-]\s*p\.?\s*(\d+)\]", re.IGNORECASE)
+    cited_pairs: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    for m in citation_re.finditer(answer or ""):
+        label, page = m.group(1), int(m.group(2))
+        doc_id = label_to_doc.get(label)
+        if doc_id is None:
+            continue
+        key = (doc_id, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        cited_pairs.append(key)
+
+    cited_pages_sorted = sorted({p for _, p in cited_pairs})
+    first_chunk_page = cited_pages_sorted[0] if cited_pages_sorted else None
+
+    # Build chunks (page text) for the cited pages so table provenance can resolve rows.
+    enriched_chunks: list[dict] = []
+    doc_id_to_path = {label_to_doc[lbl]: pdf_paths[i] for i, lbl in enumerate(doc_labels)}
+    for doc_id, page in cited_pairs:
+        path = doc_id_to_path.get(doc_id)
+        if not path:
+            continue
+        try:
+            text = extract_page_text(path, page) or ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("extract_page_text(%s, %s) failed: %s", path, page, exc)
+            text = ""
+        enriched_chunks.append({"doc_name": doc_id, "page_num": page, "text": text})
+
+    # Resolve per-row provenance against the table (if any).
+    table_md = extract_table_from_answer(answer or "")
+    row_pages: list = []
+    row_docs: list = []
+    highlight_terms_by_page: Dict[str, list] = {}
+    prov_cited_pages: list[int] = []
+    if table_md and enriched_chunks:
+        prov = resolve_table_provenance(table_md, enriched_chunks)
+        row_pages = prov.get("row_pages", []) or []
+        row_docs = prov.get("row_docs", []) or []
+        highlight_terms_by_page = prov.get("highlight_terms_by_page", {}) or {}
+        prov_cited_pages = prov.get("cited_pages", []) or []
+
+    # row_reasoning from `## Row Reasoning` section if present
+    row_reasoning: list[str] = []
+    if table_md:
+        try:
+            row_reasoning = _extract_row_reasoning(answer or "", num_rows=len(row_pages) or 0)
+        except Exception:  # noqa: BLE001
+            row_reasoning = []
+
+    merged_cited = sorted(set(cited_pages_sorted) | set(prov_cited_pages))
+
+    return {
+        "answer": answer,
+        "is_verified": True,
+        "cited_pages": merged_cited,
+        "provenance_cited_pages": prov_cited_pages,
+        "row_pages": row_pages,
+        "row_docs": row_docs,
+        "row_reasoning": row_reasoning,
+        "highlight_terms_by_page": highlight_terms_by_page,
+        "first_chunk_page": first_chunk_page,
+    }
 
 
 @ANALYZE_ROUTER.post("/export-table")

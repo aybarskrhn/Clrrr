@@ -3,7 +3,7 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from google import genai
 from google.genai import types
@@ -177,3 +177,93 @@ async def summarize_deal(
     data.setdefault("diligence_gaps", [])
     data.setdefault("next_steps", [])
     return data
+
+
+# =============================================================
+# Analyst Q&A — direct multi-PDF question answering with Gemini
+# =============================================================
+
+QA_SYSTEM_PROMPT = """You are a senior M&A due diligence analyst answering an analyst's
+question against one or more attached PDF documents.
+
+OUTPUT FORMAT:
+1. Begin with `## Direct Answer` — a 1–3 sentence direct response with inline citations.
+2. When the answer contains tabular data, render a Markdown pipe table.
+3. End with `## Caveats` if any qualifications apply.
+4. If a Markdown table is present, append a `## Row Reasoning` section with one numbered
+   bullet per data row in the form: `1. [row label]: [one-sentence reasoning]`.
+
+CITATION FORMAT (MANDATORY):
+- Cite every factual claim using `[Doc <LABEL> · p.<N>]` where <LABEL> is exactly the
+  label assigned to each PDF in the user message (e.g. `1`, `2`, ...), and <N> is the
+  1-based page number in that PDF.
+- Every numeric value, every named figure, and every table row MUST carry a citation.
+
+GROUND TRUTH:
+- The attached PDFs are the only source. Do NOT invent numbers. If a value is not
+  visible in the attached PDFs, write `not disclosed` instead of guessing.
+- Be terse. Numbers, not adjectives."""
+
+
+async def answer_question_with_pdf(
+    question: str,
+    pdf_paths: List[str],
+    context: Optional[str] = None,
+    doc_labels: Optional[List[str]] = None,
+    model: str = MODEL,
+) -> str:
+    """Answer `question` by sending the listed PDFs inline to Gemini 2.5 Flash.
+
+    Returns the raw Markdown answer string with `[Doc <label> · p.N]` citations.
+    Caller is responsible for parsing citations out of the returned text.
+    """
+    if not pdf_paths:
+        raise ValueError("answer_question_with_pdf: pdf_paths is empty")
+
+    client = _get_client()
+
+    if doc_labels is None:
+        doc_labels = [str(i + 1) for i in range(len(pdf_paths))]
+    if len(doc_labels) != len(pdf_paths):
+        raise ValueError("answer_question_with_pdf: doc_labels length mismatch")
+
+    parts: list[types.Part] = []
+    label_lines: list[str] = []
+    for label, path in zip(doc_labels, pdf_paths):
+        try:
+            with open(path, "rb") as f:
+                pdf_bytes = f.read()
+        except FileNotFoundError:
+            logger.warning("answer_question_with_pdf: missing file %s", path)
+            continue
+        parts.append(
+            types.Part(inline_data=types.Blob(data=pdf_bytes, mime_type="application/pdf"))
+        )
+        label_lines.append(f"- Doc {label} = {os.path.basename(path)}")
+
+    if not parts:
+        raise FileNotFoundError("answer_question_with_pdf: no readable PDFs found")
+
+    header = (
+        "DOCUMENT LABELS (use these exact labels in every citation):\n"
+        + "\n".join(label_lines)
+    )
+    if context:
+        header += f"\n\nDEAL CONTEXT:\n{context.strip()}"
+    user_text = f"{header}\n\nQUESTION:\n{question.strip()}"
+    parts.append(types.Part(text=user_text))
+
+    response = await client.aio.models.generate_content(
+        model=model,
+        contents=[types.Content(role="user", parts=parts)],
+        config=types.GenerateContentConfig(
+            system_instruction=QA_SYSTEM_PROMPT,
+            temperature=0.1,
+            max_output_tokens=4096,
+        ),
+    )
+    answer = (response.text or "").strip()
+    logger.info(
+        "answer_question_with_pdf: docs=%d answer_len=%d", len(parts) - 1, len(answer)
+    )
+    return answer
