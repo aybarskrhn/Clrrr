@@ -34,9 +34,11 @@ export default function AppLayout({ children }) {
       <header className="border-b border-[var(--cv-border)] bg-[var(--cv-bg)]">
         <div className="flex items-center justify-between px-6 py-3">
           <Link to="/dashboard" data-testid={NAV.brand} className="flex items-center gap-3">
-            <div className="flex h-7 w-7 items-center justify-center border border-[var(--cv-primary)] bg-[var(--cv-primary)] text-black">
-              <span className="font-mono text-sm font-bold">CV</span>
-            </div>
+            <img
+              src="/logo.png"
+              alt="ClearVault"
+              className="h-8 w-auto object-contain"
+            />
             <div className="font-heading text-base font-bold tracking-tight">
               CLEAR<span className="text-[var(--cv-primary)]">VAULT</span>
             </div>
