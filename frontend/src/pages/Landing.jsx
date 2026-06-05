@@ -138,9 +138,11 @@ export default function Landing() {
       <header className="border-b border-[var(--cv-border)] bg-[var(--cv-bg)]">
         <div className="mx-auto flex max-w-[1400px] items-center justify-between px-8 py-4">
           <Link to="/" data-testid={NAV.brand} className="flex items-center gap-3">
-            <div className="flex h-7 w-7 items-center justify-center border border-[var(--cv-primary)] bg-[var(--cv-primary)] text-black">
-              <span className="font-mono text-sm font-bold">CV</span>
-            </div>
+            <img
+              src="/logo.png"
+              alt="ClearVault"
+              className="h-10 w-auto object-contain"
+            />
             <span className="font-heading text-base font-bold tracking-tight">
               CLEAR<span className="text-[var(--cv-primary)]">VAULT</span>
             </span>
@@ -517,9 +519,11 @@ export default function Landing() {
       <footer className="bg-[var(--cv-bg)]">
         <div className="mx-auto flex max-w-[1400px] flex-col items-start justify-between gap-6 px-8 py-10 md:flex-row md:items-center">
           <div className="flex items-center gap-3">
-            <div className="flex h-7 w-7 items-center justify-center border border-[var(--cv-primary)] bg-[var(--cv-primary)] text-black">
-              <span className="font-mono text-sm font-bold">CV</span>
-            </div>
+            <img
+              src="/logo.png"
+              alt="ClearVault"
+              className="h-8 w-auto object-contain"
+            />
             <span className="font-heading text-sm font-bold tracking-tight">
               CLEAR<span className="text-[var(--cv-primary)]">VAULT</span>
             </span>

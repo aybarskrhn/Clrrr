@@ -8,8 +8,8 @@
   --cv-bg: #0a0a0a;
   --cv-surface: #121212;
   --cv-surface-hover: #1a1a1a;
-  --cv-primary: #ff8c00;
-  --cv-primary-hover: #ff9d2e;
+  --cv-primary: #3b82f6;
+  --cv-primary-hover: #60a5fa;
   --cv-text: #f3f4f6;
   --cv-muted: #9ca3af;
   --cv-border: #27272a;
@@ -44,19 +44,19 @@ body,
     --card-foreground: 220 13% 95%;
     --popover: 0 0% 7%;
     --popover-foreground: 220 13% 95%;
-    --primary: 30 100% 50%;
+    --primary: 217 91% 60%;
     --primary-foreground: 0 0% 5%;
     --secondary: 0 0% 13%;
     --secondary-foreground: 220 13% 95%;
     --muted: 0 0% 13%;
     --muted-foreground: 220 9% 65%;
-    --accent: 30 100% 50%;
+    --accent: 217 91% 60%;
     --accent-foreground: 0 0% 5%;
     --destructive: 0 84% 60%;
     --destructive-foreground: 0 0% 98%;
     --border: 240 4% 15%;
     --input: 240 4% 15%;
-    --ring: 30 100% 50%;
+    --ring: 217 91% 60%;
     --radius: 0.125rem;
   }
 }
@@ -116,8 +116,8 @@ body,
 /* Grid background */
 .cv-grid-bg {
   background-image:
-    linear-gradient(rgba(255, 140, 0, 0.045) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 140, 0, 0.045) 1px, transparent 1px);
+    linear-gradient(rgba(59, 130, 246, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(59, 130, 246, 0.045) 1px, transparent 1px);
   background-size: 56px 56px;
 }
 
@@ -152,8 +152,8 @@ body,
 
 .cv-chip-amber {
   color: var(--cv-primary);
-  border-color: rgba(255, 140, 0, 0.5);
-  background: rgba(255, 140, 0, 0.08);
+  border-color: rgba(59, 130, 246, 0.5);
+  background: rgba(59, 130, 246, 0.08);
 }
 .cv-chip-red {
   color: var(--cv-danger);
@@ -169,12 +169,12 @@ body,
 /* Dotted dropzone */
 .cv-dropzone {
   border: 1px dashed var(--cv-border);
-  background: linear-gradient(180deg, rgba(255, 140, 0, 0.02), transparent 60%);
+  background: linear-gradient(180deg, rgba(59, 130, 246, 0.02), transparent 60%);
   transition: border-color 120ms ease, background 120ms ease;
 }
 .cv-dropzone[data-dragging="true"] {
   border-color: var(--cv-primary);
-  background: rgba(255, 140, 0, 0.07);
+  background: rgba(59, 130, 246, 0.07);
 }
 
 /* Asymmetric headline marker */
