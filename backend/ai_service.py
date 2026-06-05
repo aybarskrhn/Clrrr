@@ -1,4 +1,6 @@
-"""AI extraction service using Gemini 2.5 Flash via Google AI SDK."""
+"""AI extraction service using Gemini 2.5 Flash via Google AI SDK
+and Claude Sonnet 4.6 via OpenRouter for the analyst Q&A pipeline."""
+import base64
 import json
 import logging
 import os
@@ -7,11 +9,16 @@ from typing import Any, Dict, List, Optional
 
 from google import genai
 from google.genai import types
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 MODEL = "gemini-2.5-flash"
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-6")
 
 EXTRACTION_SYSTEM_PROMPT = """You are a senior M&A due diligence analyst at a boutique investment bank. \
 Your job is to forensically analyze financial PDFs (balance sheets, income statements, contracts, \
@@ -210,24 +217,28 @@ async def answer_question_with_pdf(
     pdf_paths: List[str],
     context: Optional[str] = None,
     doc_labels: Optional[List[str]] = None,
-    model: str = MODEL,
+    model: Optional[str] = None,
 ) -> str:
-    """Answer `question` by sending the listed PDFs inline to Gemini 2.5 Flash.
+    """Answer `question` by sending the listed PDFs to Claude Sonnet 4.6 via OpenRouter.
 
-    Returns the raw Markdown answer string with `[Doc <label> · p.N]` citations.
-    Caller is responsible for parsing citations out of the returned text.
+    Claude is more deterministic for M&A table extraction + structured citation work
+    than Gemini Flash. Returns the raw Markdown answer string with `[Doc <label> · p.N]`
+    citations. Caller is responsible for parsing citations out of the returned text.
     """
     if not pdf_paths:
         raise ValueError("answer_question_with_pdf: pdf_paths is empty")
-
-    client = _get_client()
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set in backend/.env. Required for the Claude "
+            "Sonnet analyst Q&A pipeline."
+        )
 
     if doc_labels is None:
         doc_labels = [str(i + 1) for i in range(len(pdf_paths))]
     if len(doc_labels) != len(pdf_paths):
         raise ValueError("answer_question_with_pdf: doc_labels length mismatch")
 
-    parts: list[types.Part] = []
+    user_content: list[dict] = []
     label_lines: list[str] = []
     for label, path in zip(doc_labels, pdf_paths):
         try:
@@ -236,12 +247,20 @@ async def answer_question_with_pdf(
         except FileNotFoundError:
             logger.warning("answer_question_with_pdf: missing file %s", path)
             continue
-        parts.append(
-            types.Part(inline_data=types.Blob(data=pdf_bytes, mime_type="application/pdf"))
-        )
-        label_lines.append(f"- Doc {label} = {os.path.basename(path)}")
+        b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+        filename = os.path.basename(path)
+        # OpenAI-compatible PDF file part — OpenRouter routes this to Anthropic's
+        # native document content block for Claude models.
+        user_content.append({
+            "type": "file",
+            "file": {
+                "filename": filename,
+                "file_data": f"data:application/pdf;base64,{b64}",
+            },
+        })
+        label_lines.append(f"- Doc {label} = {filename}")
 
-    if not parts:
+    if not user_content:
         raise FileNotFoundError("answer_question_with_pdf: no readable PDFs found")
 
     header = (
@@ -250,20 +269,39 @@ async def answer_question_with_pdf(
     )
     if context:
         header += f"\n\nDEAL CONTEXT:\n{context.strip()}"
-    user_text = f"{header}\n\nQUESTION:\n{question.strip()}"
-    parts.append(types.Part(text=user_text))
+    user_content.append({
+        "type": "text",
+        "text": f"{header}\n\nQUESTION:\n{question.strip()}",
+    })
 
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=[types.Content(role="user", parts=parts)],
-        config=types.GenerateContentConfig(
-            system_instruction=QA_SYSTEM_PROMPT,
-            temperature=0.1,
-            max_output_tokens=4096,
-        ),
+    client = AsyncOpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers={
+            "HTTP-Referer": os.environ.get("PUBLIC_APP_URL", "https://clearvault.app"),
+            "X-Title": "ClearVault Analysis Terminal",
+        },
     )
-    answer = (response.text or "").strip()
+
+    used_model = model or OPENROUTER_MODEL
+    completion = await client.chat.completions.create(
+        model=used_model,
+        messages=[
+            {"role": "system", "content": QA_SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+        ],
+        temperature=0.1,
+        max_tokens=4096,
+        # Anthropic-specific PDF parsing hint via OpenRouter passthrough.
+        extra_body={
+            "plugins": [{"id": "file-parser", "pdf": {"engine": "native"}}],
+        },
+    )
+    answer = (completion.choices[0].message.content or "").strip()
     logger.info(
-        "answer_question_with_pdf: docs=%d answer_len=%d", len(parts) - 1, len(answer)
+        "answer_question_with_pdf [%s]: docs=%d answer_len=%d",
+        used_model,
+        len(user_content) - 1,
+        len(answer),
     )
     return answer

@@ -81,6 +81,10 @@ export default function DealDetail() {
   const [rollupLoading, setRollupLoading] = useState(false);
   const fileRef = useRef(null);
 
+  // NOTE: `selected` is intentionally NOT in deps. Including it caused an infinite
+  // refresh/setInterval rebuild loop where `setSelected(fresh)` produced a new object
+  // reference on every poll, which re-fired refresh immediately. We use the functional
+  // form of setSelected and only swap references when meaningful fields change.
   const refresh = useCallback(async () => {
     try {
       const [d, dl, r] = await Promise.all([
@@ -92,15 +96,25 @@ export default function DealDetail() {
       setDocs(dl.data);
       setRollup(r.data?.rollup || null);
       setRollupAt(r.data?.rollup_at || null);
-      if (!selected && dl.data.length) setSelected(dl.data[0]);
-      if (selected) {
-        const fresh = dl.data.find((x) => x.id === selected.id);
-        if (fresh) setSelected(fresh);
-      }
+      setSelected((prev) => {
+        if (!prev) return dl.data.length ? dl.data[0] : null;
+        const fresh = dl.data.find((x) => x.id === prev.id);
+        if (!fresh) return null; // doc was deleted — clear selection
+        // Only swap reference if a user-visible field actually changed.
+        if (
+          fresh.status === prev.status &&
+          fresh.processed_at === prev.processed_at &&
+          fresh.error === prev.error &&
+          fresh.filename === prev.filename
+        ) {
+          return prev;
+        }
+        return fresh;
+      });
     } catch (err) {
       console.error(err);
     }
-  }, [id, selected]);
+  }, [id]);
 
   useEffect(() => {
     refresh();
