@@ -107,34 +107,64 @@ def _parse_json(raw: str) -> dict:
         return json.loads(match.group(0))
 
 
-async def extract_pdf(file_path: str, model: str = MODEL) -> Dict[str, Any]:
-    """Send PDF to Gemini 2.5 Flash and return structured extraction dict."""
-    client = _get_client()
+def _openrouter_client() -> AsyncOpenAI:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "OPENROUTER_API_KEY is not set in backend/.env. Required for Claude Sonnet pipelines."
+        )
+    return AsyncOpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+        default_headers={
+            "HTTP-Referer": os.environ.get("PUBLIC_APP_URL", "https://clearvault.app"),
+            "X-Title": "ClearVault",
+        },
+    )
+
+
+async def extract_pdf(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+    """Send PDF to Claude Sonnet 4.6 via OpenRouter and return structured extraction dict."""
+    client = _openrouter_client()
+    used_model = model or OPENROUTER_MODEL
 
     with open(file_path, "rb") as f:
         pdf_bytes = f.read()
+    b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+    filename = os.path.basename(file_path)
 
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(inline_data=types.Blob(data=pdf_bytes, mime_type="application/pdf")),
-                    types.Part(text=(
-                        "Analyze the attached PDF as an M&A due diligence document and respond "
-                        "with the strict JSON schema described in your instructions. JSON only."
-                    )),
+    completion = await client.chat.completions.create(
+        model=used_model,
+        messages=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": filename,
+                            "file_data": f"data:application/pdf;base64,{b64}",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Analyze the attached PDF as an M&A due diligence document and respond "
+                            "with the strict JSON schema described in your instructions. JSON only."
+                        ),
+                    },
                 ],
-            )
+            },
         ],
-        config=types.GenerateContentConfig(
-            system_instruction=EXTRACTION_SYSTEM_PROMPT,
-        ),
+        temperature=0.1,
+        max_tokens=4096,
+        extra_body={
+            "plugins": [{"id": "file-parser", "pdf": {"engine": "native"}}],
+        },
     )
 
-    raw = response.text
-    logger.info("AI extraction raw length=%s", len(raw or ""))
+    raw = completion.choices[0].message.content or ""
+    logger.info("AI extraction [%s] raw length=%s", used_model, len(raw))
     data = _parse_json(raw)
 
     data.setdefault("document_type", "other")
@@ -148,10 +178,12 @@ async def extract_pdf(file_path: str, model: str = MODEL) -> Dict[str, Any]:
 
 
 async def summarize_deal(
-    deal_name: str, target_company: str, sector: str, documents: list, model: str = MODEL
+    deal_name: str, target_company: str, sector: str, documents: list,
+    model: Optional[str] = None,
 ) -> dict:
-    """Produce a roll-up IC memo across multiple extracted documents."""
-    client = _get_client()
+    """Produce a roll-up IC memo via Claude Sonnet 4.6 (OpenRouter)."""
+    client = _openrouter_client()
+    used_model = model or OPENROUTER_MODEL
 
     payload = {
         "deal_name": deal_name,
@@ -159,21 +191,23 @@ async def summarize_deal(
         "sector": sector,
         "documents": documents,
     }
-    text = (
+    user_text = (
         "Synthesize an IC roll-up across these extracted M&A documents. Respond JSON only.\n\n"
         + json.dumps(payload, indent=2)[:60000]
     )
 
-    response = await client.aio.models.generate_content(
-        model=model,
-        contents=text,
-        config=types.GenerateContentConfig(
-            system_instruction=ROLLUP_SYSTEM_PROMPT,
-        ),
+    completion = await client.chat.completions.create(
+        model=used_model,
+        messages=[
+            {"role": "system", "content": ROLLUP_SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+        temperature=0.1,
+        max_tokens=4096,
     )
 
-    raw = response.text
-    logger.info("Rollup raw length=%s", len(raw or ""))
+    raw = completion.choices[0].message.content or ""
+    logger.info("Rollup [%s] raw length=%s", used_model, len(raw))
     data = _parse_json(raw)
 
     data.setdefault("executive_summary", "")
