@@ -80,14 +80,14 @@ function dropRowReasoningSection(text) {
 }
 
 // Compact, Bloomberg-style markdown → JSX (headings, bold, lists, line breaks)
-function renderProse(text) {
+function renderProse(text, onCiteClick) {
   const blocks = text.split(/\n{2,}/);
   return blocks.map((block, bi) => {
     if (/^##\s+/.test(block)) {
       const heading = block.replace(/^##\s+/, "");
       return (
         <h4 key={bi} className="mt-5 font-mono text-[11px] uppercase tracking-widest text-[var(--cv-primary)]">
-          {renderInline(heading)}
+          {renderInline(heading, onCiteClick)}
         </h4>
       );
     }
@@ -96,20 +96,22 @@ function renderProse(text) {
       return (
         <ul key={bi} className="mt-2 list-disc space-y-1 pl-5 font-body text-sm text-[var(--cv-text)]">
           {items.map((it, i) => (
-            <li key={i}>{renderInline(it)}</li>
+            <li key={i}>{renderInline(it, onCiteClick)}</li>
           ))}
         </ul>
       );
     }
     return (
       <p key={bi} className="mt-2 font-body text-sm leading-relaxed text-[var(--cv-text)]">
-        {renderInline(block)}
+        {renderInline(block, onCiteClick)}
       </p>
     );
   });
 }
 
-function renderInline(text) {
+const CITE_RE = /\[Doc ([^·\]]+?) · p\.(\d+)\]/;
+
+function renderInline(text, onCiteClick) {
   // bold **x**, mono `x`, citations [Doc X · p.N] (color-only), and the unverified warning chip
   const parts = [];
   const regex = /(\*\*[^*]+\*\*|`[^`]+`|\[Doc [^\]]+\]|\[Page \d+\]|⚠️\s*unverified)/g;
@@ -132,11 +134,27 @@ function renderInline(text) {
         </code>,
       );
     } else if (tok.startsWith("[Doc") || tok.startsWith("[Page")) {
-      parts.push(
-        <span key={k++} className="font-mono text-[11px] text-[var(--cv-primary)]">
-          {tok}
-        </span>,
-      );
+      const cite = tok.match(CITE_RE);
+      if (cite && onCiteClick) {
+        const [, docName, pageNum] = cite;
+        parts.push(
+          <button
+            key={k++}
+            type="button"
+            className="cv-cite"
+            aria-label={`Open ${docName.trim()} page ${pageNum}`}
+            onClick={() => onCiteClick(docName.trim(), parseInt(pageNum, 10))}
+          >
+            {tok}
+          </button>,
+        );
+      } else {
+        parts.push(
+          <span key={k++} className="font-mono text-[11px] text-[var(--cv-primary)]">
+            {tok}
+          </span>,
+        );
+      }
     } else {
       parts.push(
         <span
@@ -169,6 +187,7 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
   const [highlightLoading, setHighlightLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
   const tableRef = useRef(null);
+  const sourcePanelRef = useRef(null);
 
   // default scope = all completed docs
   useEffect(() => {
@@ -204,13 +223,15 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
     setHighlights({});
     setSelectedPage(null);
     setSelectedDocId(null);
+    const askedScope = Array.from(scope);
     try {
       const { data } = await api.post("/analyze", {
         question: question.trim(),
-        doc_scope: Array.from(scope),
+        doc_scope: askedScope,
         n_results: 2,
       });
-      setResult(data);
+      // _scope = doc ids in the order sent — citation labels "Doc 1", "Doc 2"… map to it
+      setResult({ ...data, _scope: askedScope });
 
       // Pick the first provenance/cited/chunk page (per blueprint fallback chain)
       const firstPage =
@@ -274,6 +295,41 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
     } finally {
       setHighlightLoading(false);
     }
+  };
+
+  const flashSourcePanel = () => {
+    requestAnimationFrame(() => {
+      const el = sourcePanelRef.current;
+      if (!el) return;
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      el.classList.remove("cv-flash");
+      void el.offsetWidth; // restart animation
+      el.classList.add("cv-flash");
+    });
+  };
+
+  const onCiteClick = (docLabel, pageNum) => {
+    if (!pageNum) return;
+    // Labels are 1-based indices into the doc_scope sent with the question;
+    // fall back to filename match, then first scoped doc.
+    const askedScope = result?._scope || Array.from(scope);
+    const n = parseInt(docLabel, 10);
+    let docId = !Number.isNaN(n) ? askedScope[n - 1] : null;
+    if (!docId) {
+      docId =
+        Object.keys(docNameById).find((id) => docNameById[id] === docLabel) ||
+        askedScope[0] ||
+        null;
+    }
+    if (!docId) return;
+    const terms = (result?.highlight_terms_by_page || {})[String(pageNum)] || [];
+    if (highlights[`${docId}::${pageNum}`]) {
+      setSelectedDocId(docId);
+      setSelectedPage(pageNum);
+    } else {
+      fetchHighlight(docId, pageNum, terms);
+    }
+    flashSourcePanel();
   };
 
   const onRowClick = (rowIdx) => {
@@ -452,7 +508,7 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
             )}
 
             <article className="border border-[var(--cv-border)] bg-[var(--cv-surface)] p-5">
-              {renderProse(proseAnswer)}
+              {renderProse(proseAnswer, onCiteClick)}
             </article>
 
             {parsed.header.length > 0 && (
@@ -506,7 +562,7 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
                           >
                             {row.map((cell, ci) => (
                               <td key={ci} className="px-3 py-2 text-[var(--cv-text)]">
-                                {renderInline(cell)}
+                                {renderInline(cell, onCiteClick)}
                               </td>
                             ))}
                             <td className="px-3 py-2">
@@ -533,7 +589,11 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
 
           {/* PDF page preview with highlight overlay */}
           <aside className="col-span-12 lg:col-span-5">
-            <div className="sticky top-4 border border-[var(--cv-border)] bg-[var(--cv-surface)]">
+            <div
+              ref={sourcePanelRef}
+              data-cv-page={selectedPage ?? ""}
+              className="sticky top-4 border border-[var(--cv-border)] bg-[var(--cv-surface)]"
+            >
               <div className="flex items-center justify-between border-b border-[var(--cv-border)] px-4 py-3">
                 <span className="font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
                   Source page

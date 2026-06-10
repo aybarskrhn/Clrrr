@@ -100,56 +100,6 @@ def _get_gemini_client() -> genai.Client:
     return genai.Client(api_key=GOOGLE_API_KEY)
 
 
-ANALYSIS_SYSTEM_PROMPT = (
-    "You are a senior M&A due diligence analyst. "
-    "Answer the analyst's question using ONLY the attached PDF document(s). "
-    "For every factual claim, cite the source with [Doc {filename} · p.{page}]. "
-    "If the answer is not in the documents, say so explicitly and list which "
-    "pages you checked. NEVER fabricate values or page numbers. If the question "
-    "references a specific page, describe what is actually on that page."
-)
-
-
-async def answer_question_with_pdf(
-    question: str,
-    doc_file_paths: list[str],
-    deal_context: dict | None = None,
-) -> dict:
-    """Send PDFs + question to Gemini 2.5 Flash and get a cited answer."""
-    client = _get_gemini_client()
-
-    parts = []
-    for path in doc_file_paths:
-        with open(path, "rb") as f:
-            parts.append(types.Part(
-                inline_data=types.Blob(
-                    data=f.read(),
-                    mime_type="application/pdf",
-                )
-            ))
-    parts.append(types.Part(text=(
-        f"Question: {question}\n\n"
-        "Answer using ONLY the attached PDFs. Cite every factual claim "
-        "with [Doc {filename} · p.{page}]. If not found, state so and "
-        "list which pages you searched. Never fabricate."
-    )))
-
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[types.Content(role="user", parts=parts)],
-        config=types.GenerateContentConfig(
-            system_instruction=ANALYSIS_SYSTEM_PROMPT,
-            temperature=0.1,
-            max_output_tokens=4096,
-        ),
-    )
-    return {
-        "answer": response.text or "",
-        "model": GEMINI_MODEL,
-        "docs_attached": [os.path.basename(p) for p in doc_file_paths],
-    }
-
-
 def _strip_json(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("```"):
@@ -237,45 +187,41 @@ def _parse_json(raw: str) -> dict:
         ) from e
 
 
-async def extract_pdf(file_path: str, model: str = MODEL) -> Dict[str, Any]:
-    """Send PDF to Claude via OpenRouter and return structured extraction dict."""
-    client = _get_client()
+async def extract_pdf(file_path: str, model: str = GEMINI_MODEL) -> Dict[str, Any]:
+    """Send PDF to Gemini and return structured extraction dict."""
+    client = _get_gemini_client()
 
+    file_path = os.path.abspath(file_path)
     with open(file_path, "rb") as f:
         pdf_bytes = f.read()
-    b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
-    filename = os.path.basename(file_path)
 
-    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+    assert pdf_bytes, "empty pdf bytes"
+    assert os.path.getsize(file_path) > 0, "zero-byte file on disk"
+    logger.info("extract_pdf send: path=%s bytes=%s mime=application/pdf",
+                file_path, len(pdf_bytes))
 
-    response = await client.chat.completions.create(
+    parts = [
+        types.Part(
+            inline_data=types.Blob(
+                data=pdf_bytes,
+                mime_type="application/pdf",
+            )
+        ),
+        types.Part(text=(
+            "Analyze the attached PDF as an M&A due diligence document and respond "
+            "with the strict JSON schema described in your instructions. JSON only."
+        )),
+    ]
+
+    response = await client.aio.models.generate_content(
         model=model,
-        messages=[
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_b64,
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            "Analyze the attached PDF as an M&A due diligence document and respond "
-                            "with the strict JSON schema described in your instructions. JSON only."
-                        ),
-                    },
-                ],
-            },
-        ],
+        contents=[types.Content(role="user", parts=parts)],
+        config=types.GenerateContentConfig(
+            system_instruction=EXTRACTION_SYSTEM_PROMPT,
+        ),
     )
 
-    raw = response.choices[0].message.content
+    raw = response.text
     logger.info("AI extraction raw length=%s", len(raw or ""))
     data = _parse_json(raw)
 
@@ -293,9 +239,9 @@ async def summarize_deal(
     deal_name: str, target_company: str, sector: str, documents: list,
     model: Optional[str] = None,
 ) -> dict:
-    """Produce a roll-up IC memo via Claude Sonnet 4.6 (OpenRouter)."""
-    client = _openrouter_client()
-    used_model = model or OPENROUTER_MODEL
+    """Produce a roll-up IC memo via Gemini."""
+    client = _get_gemini_client()
+    used_model = model or GEMINI_MODEL
 
     payload = {
         "deal_name": deal_name,
@@ -308,15 +254,15 @@ async def summarize_deal(
         + json.dumps(payload, indent=2)[:60000]
     )
 
-    response = await client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": ROLLUP_SYSTEM_PROMPT},
-            {"role": "user", "content": text},
-        ],
+    response = await client.aio.models.generate_content(
+        model=used_model,
+        contents=[types.Content(role="user", parts=[types.Part(text=user_text)])],
+        config=types.GenerateContentConfig(
+            system_instruction=ROLLUP_SYSTEM_PROMPT,
+        ),
     )
 
-    raw = response.choices[0].message.content
+    raw = response.text
     logger.info("Rollup raw length=%s", len(raw or ""))
     data = _parse_json(raw)
 

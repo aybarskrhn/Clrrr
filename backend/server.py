@@ -21,7 +21,7 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-from ai_service import answer_question_with_pdf, extract_pdf, summarize_deal  # noqa: E402
+from ai_service import OPENROUTER_MODEL, answer_question_with_pdf, extract_pdf, summarize_deal  # noqa: E402
 from analysis_pipeline import (  # noqa: E402
     _extract_row_reasoning,
     answer_with_citations,  # noqa: F401  (kept for backwards-compat / future use)
@@ -29,6 +29,7 @@ from analysis_pipeline import (  # noqa: E402
 )
 from provenance import extract_table_from_answer, resolve_table_provenance  # noqa: E402
 from extractor import (  # noqa: E402
+    extract_all_page_texts,
     extract_page_text,
     page_count as pdf_page_count,
     render_page_with_highlights,
@@ -1337,6 +1338,19 @@ class PageTextRequest(BaseModel):
     page_num: int
 
 
+def _us_to_de_numbers(text: str) -> str:
+    """Convert US-formatted numbers (1,479.6) to German locale (1.479,6).
+
+    LLMs normalize figures to US format even when the PDF text layer is German,
+    which breaks exact-match provenance. Used for a second resolver pass only.
+    """
+    def conv(m: "re.Match[str]") -> str:
+        return m.group(0).replace(",", "\0").replace(".", ",").replace("\0", ".")
+
+    swapped = re.sub(r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+", conv, text)
+    return re.sub(r"–(?=\d)", "-", swapped)
+
+
 async def _resolve_scope_docs(doc_ids: List[str], user_id: str) -> list[dict]:
     org_ids = await _user_org_ids(user_id)
     out: list[dict] = []
@@ -1376,9 +1390,56 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_i
             content={"error": "No document files found on disk.", "cited_pages": [], "is_verified": False},
         )
 
+    # Raw PDF page text is the provenance ground truth — one chunk per page.
+    source_chunks: list[dict] = []
+    for d in docs:
+        if not d.get("pdf_path"):
+            continue
+        for page_num, page_text in extract_all_page_texts(d["pdf_path"]).items():
+            if page_text.strip():
+                source_chunks.append({
+                    "doc_name": d["doc_name"],
+                    "page_num": page_num,
+                    "text": page_text,
+                })
+
     try:
-        result = await answer_question_with_pdf(req.question, doc_paths)
-        return {"answer": result["answer"], "model": result["model"], "is_verified": True}
+        raw = await answer_question_with_pdf(req.question, doc_paths)
+        if isinstance(raw, dict):
+            answer_text = raw.get("answer", "")
+            model_used = raw.get("model", OPENROUTER_MODEL)
+        else:
+            answer_text = raw or ""
+            model_used = OPENROUTER_MODEL
+
+        table_md = extract_table_from_answer(answer_text)
+        if table_md:
+            table_md = table_md.replace("**", "")  # bold markers never appear in raw PDF text
+        if table_md and source_chunks:
+            prov = resolve_table_provenance(table_md, source_chunks)
+            if any(p is None for p in prov["row_pages"]):
+                alt = resolve_table_provenance(_us_to_de_numbers(table_md), source_chunks)
+                for i, p in enumerate(alt["row_pages"]):
+                    if prov["row_pages"][i] is None and p is not None:
+                        prov["row_pages"][i] = p
+                        prov["row_docs"][i] = alt["row_docs"][i]
+                for k, terms in alt["highlight_terms_by_page"].items():
+                    bucket = prov["highlight_terms_by_page"].setdefault(k, [])
+                    bucket.extend(t for t in terms if t not in bucket)
+                prov["cited_pages"] = sorted(int(k) for k in prov["highlight_terms_by_page"])
+        else:
+            prov = {"row_pages": [], "row_docs": [],
+                    "highlight_terms_by_page": {}, "cited_pages": []}
+        return {
+            "answer": answer_text,
+            "model": model_used,
+            "is_verified": True,
+            "row_pages": prov["row_pages"],
+            "row_docs": prov["row_docs"],
+            "row_reasoning": _extract_row_reasoning(answer_text, len(prov["row_pages"])),
+            "highlight_terms_by_page": prov["highlight_terms_by_page"],
+            "provenance_cited_pages": prov["cited_pages"],
+        }
     except FileNotFoundError:
         return {"answer": "One of the documents is no longer on disk. "
                           "Please re-upload and try again.", "is_verified": False}
@@ -1428,6 +1489,12 @@ async def highlight_page(req: HighlightRequest, user_id: str = Depends(get_curre
     if not pdf_path:
         raise HTTPException(status_code=404, detail="Document file not available")
     png, quads = render_page_with_highlights(pdf_path, req.page_num, req.search_terms)
+    if quads == 0 and req.search_terms:
+        logger.info(
+            "highlight-page: 0 quads doc=%s p=%s terms=%r page_text_head=%r",
+            req.doc_name, req.page_num, req.search_terms[:10],
+            extract_page_text(pdf_path, req.page_num)[:300],
+        )
     if not png:
         return {"page_png_b64": "", "quad_count": 0, "page_num": req.page_num, "doc_name": req.doc_name}
     return {

@@ -207,3 +207,40 @@ body,
     display: contents !important;
   }
 }
+
+/* Citation source-tracing */
+.cv-cite {
+  color: #3B82F6;
+  background: transparent;
+  border: none;
+  border-bottom: 1px dashed #3B82F6;
+  cursor: pointer;
+  padding: 0 1px;
+  font: inherit;
+  transition: background-color 150ms ease, color 150ms ease;
+}
+.cv-cite:hover {
+  color: #1E40AF;
+  background: rgba(59, 130, 246, 0.08);
+}
+.cv-flash {
+  animation: cvFlash 1.6s ease-out;
+  box-shadow: inset 0 0 0 2px rgba(59, 130, 246, 0);
+}
+@keyframes cvFlash {
+  0% {
+    box-shadow: inset 0 0 0 0 rgba(59, 130, 246, 0);
+    background-color: rgba(59, 130, 246, 0);
+  }
+  15% {
+    box-shadow: inset 0 0 0 3px rgba(59, 130, 246, 0.55);
+    background-color: rgba(59, 130, 246, 0.18);
+  }
+  100% {
+    box-shadow: inset 0 0 0 0 rgba(59, 130, 246, 0);
+    background-color: rgba(59, 130, 246, 0);
+  }
+}
+html {
+  scroll-behavior: smooth;
+}
