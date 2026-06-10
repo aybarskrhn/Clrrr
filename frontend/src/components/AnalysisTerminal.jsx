@@ -163,7 +163,8 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
   const [question, setQuestion] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
-  const [highlights, setHighlights] = useState({}); // {page: {png_b64, quad_count}}
+  const [highlights, setHighlights] = useState({}); // {`${docId}::${page}`: {png_b64, quad_count}}
+  const [selectedDocId, setSelectedDocId] = useState(null);
   const [selectedPage, setSelectedPage] = useState(null);
   const [highlightLoading, setHighlightLoading] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -202,6 +203,7 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
     setResult(null);
     setHighlights({});
     setSelectedPage(null);
+    setSelectedDocId(null);
     try {
       const { data } = await api.post("/analyze", {
         question: question.trim(),
@@ -216,15 +218,16 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
         (data.cited_pages && data.cited_pages[0]) ??
         data.first_chunk_page ??
         null;
+      const firstDocId = (data.row_docs || []).find((d) => !!d) || Array.from(scope)[0] || null;
       if (firstPage) setSelectedPage(firstPage);
+      if (firstDocId) setSelectedDocId(firstDocId);
 
       // Auto-fetch highlight for the first provenance-cited page
       const hbp = data.highlight_terms_by_page || {};
       const pageKeys = Object.keys(hbp);
-      if (pageKeys.length && data.row_docs && data.row_docs.length) {
-        const firstDocId = data.row_docs.find((d) => !!d) || Array.from(scope)[0];
+      if (pageKeys.length && firstDocId) {
         const firstPageKey = String(firstPage ?? pageKeys[0]);
-        if (firstDocId && hbp[firstPageKey]) {
+        if (hbp[firstPageKey]) {
           fetchHighlight(firstDocId, parseInt(firstPageKey, 10), hbp[firstPageKey]);
         }
       }
@@ -264,6 +267,7 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
           quad_count: data.quad_count,
         },
       }));
+      setSelectedDocId(docId);
       setSelectedPage(pageNum);
     } catch (err) {
       toast.error("Failed to render highlighted page");
@@ -283,6 +287,7 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
     const terms = (result.highlight_terms_by_page || {})[String(page)] || [];
     const cacheKey = `${doc}::${page}`;
     if (highlights[cacheKey]) {
+      setSelectedDocId(doc);
       setSelectedPage(page);
       return;
     }
@@ -323,12 +328,9 @@ export default function AnalysisTerminal({ deal, documents = [] }) {
     ? dropRowReasoningSection(tableLines ? stripTable(result.answer) : result.answer)
     : "";
 
-  // Currently-displayed highlight image
-  const currentDocId = useMemo(() => {
-    if (!result) return null;
-    return (result.row_docs || []).find((d) => !!d) || Array.from(scope)[0] || null;
-  }, [result, scope]);
-
+  // Currently-displayed highlight image — keyed off the row the user explicitly
+  // selected (or the first provenance row on initial load).
+  const currentDocId = selectedDocId;
   const currentKey = currentDocId && selectedPage ? `${currentDocId}::${selectedPage}` : null;
   const currentHighlight = currentKey ? highlights[currentKey] : null;
 

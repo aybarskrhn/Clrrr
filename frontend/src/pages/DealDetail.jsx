@@ -153,9 +153,18 @@ export default function DealDetail() {
 
   const deleteDoc = async (docId) => {
     if (!window.confirm("Delete this document and its extraction?")) return;
-    await api.delete(`/documents/${docId}`);
+    // Optimistically remove from UI so the polling refresh can't race us.
+    const before = docs;
     setDocs((arr) => arr.filter((d) => d.id !== docId));
     if (selected?.id === docId) setSelected(null);
+    try {
+      await api.delete(`/documents/${docId}`);
+      toast.success("Document deleted");
+    } catch (err) {
+      // Roll back optimistic remove
+      setDocs(before);
+      toast.error(err?.response?.data?.detail || "Delete failed");
+    }
   };
 
   const exportCsv = async () => {

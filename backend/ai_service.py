@@ -96,15 +96,83 @@ def _strip_json(raw: str) -> str:
     return raw.strip()
 
 
+def _repair_json(s: str) -> str:
+    """Best-effort repair for common LLM JSON glitches.
+
+    Handles: trailing commas before } or ], single-quoted keys, NaN/Infinity,
+    smart quotes, stray control chars, and unterminated strings at the tail
+    (truncation due to max_tokens).
+    """
+    # Strip control chars except \n \t \r
+    s = "".join(ch for ch in s if ch >= " " or ch in "\n\t\r")
+    # Smart quotes → ASCII
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace("\u2019", "'")
+    # Trailing commas before closing brackets
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    # NaN / Infinity → null
+    s = re.sub(r"\bNaN\b|\b-?Infinity\b", "null", s)
+    return s
+
+
+def _balance_brackets(s: str) -> str:
+    """If the JSON was truncated mid-structure, append missing } and ] in correct order."""
+    stack: list[str] = []
+    in_str = False
+    esc = False
+    for ch in s:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\" and in_str:
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+    if in_str:
+        s += '"'
+    while stack:
+        s += "}" if stack.pop() == "{" else "]"
+    return s
+
+
 def _parse_json(raw: str) -> dict:
     cleaned = _strip_json(raw)
+    # 1) straight parse
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", cleaned)
-        if not match:
-            raise
-        return json.loads(match.group(0))
+        pass
+    # 2) extract widest {...} envelope
+    match = re.search(r"\{[\s\S]*\}", cleaned)
+    candidate = match.group(0) if match else cleaned
+    # 3) repair common LLM glitches
+    repaired = _repair_json(candidate)
+    try:
+        return json.loads(repaired)
+    except json.JSONDecodeError:
+        pass
+    # 4) balance truncated brackets/strings (typical max_tokens cutoff)
+    balanced = _balance_brackets(_repair_json(candidate))
+    try:
+        return json.loads(balanced)
+    except json.JSONDecodeError as e:
+        logger.error(
+            "JSON parse failed after repair attempts (len=%d, head=%r, tail=%r)",
+            len(candidate), candidate[:200], candidate[-200:],
+        )
+        raise RuntimeError(
+            f"LLM returned malformed JSON that could not be repaired: {e}. "
+            "Likely a truncated response — consider raising max_tokens or splitting the PDF."
+        ) from e
 
 
 def _openrouter_client() -> AsyncOpenAI:
@@ -150,14 +218,17 @@ async def extract_pdf(file_path: str, model: Optional[str] = None) -> Dict[str, 
                         "type": "text",
                         "text": (
                             "Analyze the attached PDF as an M&A due diligence document and respond "
-                            "with the strict JSON schema described in your instructions. JSON only."
+                            "with the strict JSON schema described in your instructions. "
+                            "Return ONLY raw JSON — no markdown fences, no commentary, no trailing "
+                            "commas. Cap each free-text field at ~200 chars and keep arrays ≤12 items "
+                            "so the response fits in 8000 output tokens."
                         ),
                     },
                 ],
             },
         ],
         temperature=0.1,
-        max_tokens=4096,
+        max_tokens=8000,
         extra_body={
             "plugins": [{"id": "file-parser", "pdf": {"engine": "native"}}],
         },

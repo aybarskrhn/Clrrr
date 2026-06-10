@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import AppLayout from "@/components/AppLayout";
 import api from "@/lib/api";
-import { Briefcase } from "lucide-react";
+import { Briefcase, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 
 export default function Deals() {
   const [deals, setDeals] = useState([]);
@@ -11,6 +12,23 @@ export default function Deals() {
   useEffect(() => {
     api.get("/deals").then(({ data }) => setDeals(data));
   }, []);
+
+  const deleteDeal = async (e, deal) => {
+    e.stopPropagation();
+    if (
+      !window.confirm(
+        `Permanently delete "${deal.name}"? This removes its documents, extractions and roll-up.`
+      )
+    )
+      return;
+    try {
+      await api.delete(`/deals/${deal.id}`);
+      setDeals((arr) => arr.filter((d) => d.id !== deal.id));
+      toast.success(`Deleted ${deal.name}`);
+    } catch (err) {
+      toast.error(err?.response?.data?.detail || "Delete failed");
+    }
+  };
 
   return (
     <AppLayout>
@@ -41,12 +59,13 @@ export default function Deals() {
                 <th className="px-4 py-3 text-right">Docs</th>
                 <th className="px-4 py-3 text-right">Flags</th>
                 <th className="px-4 py-3">Created</th>
+                <th className="px-4 py-3" />
               </tr>
             </thead>
             <tbody>
               {deals.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-16 text-center text-[var(--cv-muted)]">
+                  <td colSpan={8} className="px-4 py-16 text-center text-[var(--cv-muted)]">
                     <div className="mb-3 flex justify-center">
                       <Briefcase className="h-8 w-8 opacity-60" />
                     </div>
@@ -73,6 +92,16 @@ export default function Deals() {
                     {d.red_flags_count}
                   </td>
                   <td className="px-4 py-3 text-[var(--cv-muted)]">{d.created_at?.slice(0, 10)}</td>
+                  <td className="px-4 py-3 text-right">
+                    <button
+                      onClick={(e) => deleteDeal(e, d)}
+                      data-testid={`delete-deal-${d.id}`}
+                      title="Delete deal"
+                      className="inline-flex h-7 w-7 items-center justify-center border border-[var(--cv-border)] text-[var(--cv-muted)] transition-colors hover:border-[var(--cv-danger)] hover:bg-[var(--cv-danger)]/10 hover:text-[var(--cv-danger)]"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </td>
                 </tr>
               ))}
             </tbody>
