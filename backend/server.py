@@ -20,7 +20,7 @@ from starlette.middleware.cors import CORSMiddleware
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-from ai_service import extract_pdf, summarize_deal  # noqa: E402
+from ai_service import answer_question_with_pdf, extract_pdf, summarize_deal  # noqa: E402
 from analysis_pipeline import (  # noqa: E402
     answer_with_citations,
     markdown_table_to_csv,
@@ -57,7 +57,7 @@ mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
-UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "/tmp/clearvault_uploads"))
+UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR", "./uploads"))
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 MAX_PDF_BYTES = 50 * 1024 * 1024  # 50 MB
 
@@ -1364,29 +1364,26 @@ async def analyze(req: AnalyzeRequest, user_id: str = Depends(get_current_user_i
     if not docs:
         return JSONResponse(
             status_code=422,
-            content={"error": "No relevant pages found.", "cited_pages": [], "is_verified": False},
+            content={"error": "No document files found.", "cited_pages": [], "is_verified": False},
         )
 
-    try:
-        chunks = retrieve_chunks(req.question, docs, n_results=max(1, req.n_results))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("retrieve_chunks failed")
-        raise HTTPException(status_code=500, detail=f"Retrieval failed: {exc}")
-
-    if not chunks:
+    doc_paths = [d["pdf_path"] for d in docs if d.get("pdf_path")]
+    if not doc_paths:
         return JSONResponse(
             status_code=422,
-            content={"error": "No relevant pages found.", "cited_pages": [], "is_verified": False},
+            content={"error": "No document files found on disk.", "cited_pages": [], "is_verified": False},
         )
 
     try:
-        result = answer_with_citations(req.question, chunks, doc_filter=req.doc_scope)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("answer_with_citations failed")
-        raise HTTPException(status_code=502, detail=f"OpenRouter call failed: {exc}")
-
-    result.pop("source_chunks", None)
-    return result
+        result = await answer_question_with_pdf(req.question, doc_paths)
+        return {"answer": result["answer"], "model": result["model"], "is_verified": True}
+    except FileNotFoundError:
+        return {"answer": "One of the documents is no longer on disk. "
+                          "Please re-upload and try again.", "is_verified": False}
+    except Exception as e:  # noqa: BLE001
+        logger.exception("analyze failed")
+        return {"answer": f"The analysis service is temporarily unavailable. "
+                          f"Reason: {type(e).__name__}", "is_verified": False}
 
 
 @ANALYZE_ROUTER.post("/export-table")

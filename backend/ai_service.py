@@ -1,4 +1,5 @@
-"""AI extraction service using Gemini 2.5 Flash via Google AI SDK."""
+"""AI extraction service — OpenRouter (extract/rollup) + Gemini 2.5 Flash (analysis)."""
+import base64
 import json
 import logging
 import os
@@ -7,11 +8,16 @@ from typing import Any, Dict
 
 from google import genai
 from google.genai import types
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+OPENROUTER_BASE_URL = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+MODEL = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-6")
+
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
-MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 EXTRACTION_SYSTEM_PROMPT = """You are a senior M&A due diligence analyst at a boutique investment bank. \
 Your job is to forensically analyze financial PDFs (balance sheets, income statements, contracts, \
@@ -72,13 +78,72 @@ Rules:
 """
 
 
-def _get_client() -> genai.Client:
-    if not GOOGLE_API_KEY:
+def _get_client() -> AsyncOpenAI:
+    if not OPENROUTER_API_KEY:
         raise RuntimeError(
-            "GOOGLE_API_KEY is not set. "
-            "Get a free key at https://aistudio.google.com/apikey and add it to backend/.env"
+            "OPENROUTER_API_KEY is not set. "
+            "Add it to backend/.env"
         )
+    return AsyncOpenAI(
+        api_key=OPENROUTER_API_KEY,
+        base_url=OPENROUTER_BASE_URL,
+    )
+
+
+def _get_gemini_client() -> genai.Client:
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("GOOGLE_API_KEY is not set. Add it to backend/.env")
     return genai.Client(api_key=GOOGLE_API_KEY)
+
+
+ANALYSIS_SYSTEM_PROMPT = (
+    "You are a senior M&A due diligence analyst. "
+    "Answer the analyst's question using ONLY the attached PDF document(s). "
+    "For every factual claim, cite the source with [Doc {filename} · p.{page}]. "
+    "If the answer is not in the documents, say so explicitly and list which "
+    "pages you checked. NEVER fabricate values or page numbers. If the question "
+    "references a specific page, describe what is actually on that page."
+)
+
+
+async def answer_question_with_pdf(
+    question: str,
+    doc_file_paths: list[str],
+    deal_context: dict | None = None,
+) -> dict:
+    """Send PDFs + question to Gemini 2.5 Flash and get a cited answer."""
+    client = _get_gemini_client()
+
+    parts = []
+    for path in doc_file_paths:
+        with open(path, "rb") as f:
+            parts.append(types.Part(
+                inline_data=types.Blob(
+                    data=f.read(),
+                    mime_type="application/pdf",
+                )
+            ))
+    parts.append(types.Part(text=(
+        f"Question: {question}\n\n"
+        "Answer using ONLY the attached PDFs. Cite every factual claim "
+        "with [Doc {filename} · p.{page}]. If not found, state so and "
+        "list which pages you searched. Never fabricate."
+    )))
+
+    response = await client.aio.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=[types.Content(role="user", parts=parts)],
+        config=types.GenerateContentConfig(
+            system_instruction=ANALYSIS_SYSTEM_PROMPT,
+            temperature=0.1,
+            max_output_tokens=4096,
+        ),
+    )
+    return {
+        "answer": response.text or "",
+        "model": GEMINI_MODEL,
+        "docs_attached": [os.path.basename(p) for p in doc_file_paths],
+    }
 
 
 def _strip_json(raw: str) -> str:
@@ -101,32 +166,42 @@ def _parse_json(raw: str) -> dict:
 
 
 async def extract_pdf(file_path: str, model: str = MODEL) -> Dict[str, Any]:
-    """Send PDF to Gemini 2.5 Flash and return structured extraction dict."""
+    """Send PDF to Claude via OpenRouter and return structured extraction dict."""
     client = _get_client()
 
     with open(file_path, "rb") as f:
         pdf_bytes = f.read()
 
-    response = await client.aio.models.generate_content(
+    pdf_b64 = base64.standard_b64encode(pdf_bytes).decode("utf-8")
+
+    response = await client.chat.completions.create(
         model=model,
-        contents=[
-            types.Content(
-                role="user",
-                parts=[
-                    types.Part(inline_data=types.Blob(data=pdf_bytes, mime_type="application/pdf")),
-                    types.Part(text=(
-                        "Analyze the attached PDF as an M&A due diligence document and respond "
-                        "with the strict JSON schema described in your instructions. JSON only."
-                    )),
+        messages=[
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Analyze the attached PDF as an M&A due diligence document and respond "
+                            "with the strict JSON schema described in your instructions. JSON only."
+                        ),
+                    },
                 ],
-            )
+            },
         ],
-        config=types.GenerateContentConfig(
-            system_instruction=EXTRACTION_SYSTEM_PROMPT,
-        ),
     )
 
-    raw = response.text
+    raw = response.choices[0].message.content
     logger.info("AI extraction raw length=%s", len(raw or ""))
     data = _parse_json(raw)
 
@@ -157,15 +232,15 @@ async def summarize_deal(
         + json.dumps(payload, indent=2)[:60000]
     )
 
-    response = await client.aio.models.generate_content(
+    response = await client.chat.completions.create(
         model=model,
-        contents=text,
-        config=types.GenerateContentConfig(
-            system_instruction=ROLLUP_SYSTEM_PROMPT,
-        ),
+        messages=[
+            {"role": "system", "content": ROLLUP_SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ],
     )
 
-    raw = response.text
+    raw = response.choices[0].message.content
     logger.info("Rollup raw length=%s", len(raw or ""))
     data = _parse_json(raw)
 

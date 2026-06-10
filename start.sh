@@ -18,6 +18,7 @@ lsof -ti:3000 | xargs kill -9 2>/dev/null || true
 
 echo "Starting backend..."
 cd "$ROOT/backend"
+source .venv/bin/activate
 uvicorn server:app --host 0.0.0.0 --port 8001 --reload &
 BACKEND_PID=$!
 
