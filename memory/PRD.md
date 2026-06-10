@@ -20,6 +20,11 @@ financials + severity-ranked red flags in <90 seconds.
 - Dashboard with KPI stats, deal book table, recent activity ticker
 - Bloomberg-terminal landing page (hero, features, security, pricing)
 - Auth pages, Dashboard, Deals list, Deal detail w/ extraction viewer, Upload ingest page
+- Blue visual identity (orange → blue theme + logo placeholder, Feb 2026)
+- Analysis Terminal `/api/analyze` powered by Claude Sonnet 4.6 via OpenRouter (PDF
+  inline parsing + citation extraction `[Doc <label> · p.N]`, Feb 2026)
+- DealDetail state-loop fix: eliminated infinite refresh that caused PDF carousel glitch
+  + broken viewer + broken delete (Feb 2026)
 
 ## Backlog (P0/P1)
 - P0: Excel/CSV export of extracted financials

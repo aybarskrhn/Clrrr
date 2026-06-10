@@ -81,6 +81,10 @@ export default function DealDetail() {
   const [rollupLoading, setRollupLoading] = useState(false);
   const fileRef = useRef(null);
 
+  // NOTE: `selected` is intentionally NOT in deps. Including it caused an infinite
+  // refresh/setInterval rebuild loop where `setSelected(fresh)` produced a new object
+  // reference on every poll, which re-fired refresh immediately. We use the functional
+  // form of setSelected and only swap references when meaningful fields change.
   const refresh = useCallback(async () => {
     try {
       const [d, dl, r] = await Promise.all([
@@ -92,15 +96,25 @@ export default function DealDetail() {
       setDocs(dl.data);
       setRollup(r.data?.rollup || null);
       setRollupAt(r.data?.rollup_at || null);
-      if (!selected && dl.data.length) setSelected(dl.data[0]);
-      if (selected) {
-        const fresh = dl.data.find((x) => x.id === selected.id);
-        if (fresh) setSelected(fresh);
-      }
+      setSelected((prev) => {
+        if (!prev) return dl.data.length ? dl.data[0] : null;
+        const fresh = dl.data.find((x) => x.id === prev.id);
+        if (!fresh) return null; // doc was deleted — clear selection
+        // Only swap reference if a user-visible field actually changed.
+        if (
+          fresh.status === prev.status &&
+          fresh.processed_at === prev.processed_at &&
+          fresh.error === prev.error &&
+          fresh.filename === prev.filename
+        ) {
+          return prev;
+        }
+        return fresh;
+      });
     } catch (err) {
       console.error(err);
     }
-  }, [id, selected]);
+  }, [id]);
 
   useEffect(() => {
     refresh();
@@ -139,9 +153,18 @@ export default function DealDetail() {
 
   const deleteDoc = async (docId) => {
     if (!window.confirm("Delete this document and its extraction?")) return;
-    await api.delete(`/documents/${docId}`);
+    // Optimistically remove from UI so the polling refresh can't race us.
+    const before = docs;
     setDocs((arr) => arr.filter((d) => d.id !== docId));
     if (selected?.id === docId) setSelected(null);
+    try {
+      await api.delete(`/documents/${docId}`);
+      toast.success("Document deleted");
+    } catch (err) {
+      // Roll back optimistic remove
+      setDocs(before);
+      toast.error(err?.response?.data?.detail || "Delete failed");
+    }
   };
 
   const exportCsv = async () => {
@@ -361,10 +384,11 @@ function OverviewTab({ docs, selected, setSelected, deleteDoc, ex }) {
                     e.stopPropagation();
                     deleteDoc(d.id);
                   }}
-                  className="opacity-0 transition-opacity group-hover:opacity-100"
-                  title="Delete"
+                  data-testid={`delete-doc-${d.id}`}
+                  title="Delete document"
+                  className="flex h-7 w-7 items-center justify-center border border-[var(--cv-border)] text-[var(--cv-muted)] transition-colors hover:border-[var(--cv-danger)] hover:bg-[var(--cv-danger)]/10 hover:text-[var(--cv-danger)]"
                 >
-                  <Trash2 className="h-3.5 w-3.5 text-[var(--cv-muted)] hover:text-[var(--cv-danger)]" />
+                  <Trash2 className="h-3.5 w-3.5" />
                 </button>
               </li>
             );
@@ -610,7 +634,7 @@ function PreviewTab({ docs, selected, setSelected, ex }) {
       {/* Iframe */}
       <div className="col-span-12 md:col-span-8">
         <div className="flex items-center justify-between border border-b-0 border-[var(--cv-border)] bg-[var(--cv-surface)] px-4 py-2">
-          <span className="font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
+          <span className="truncate font-mono text-[11px] uppercase tracking-widest text-[var(--cv-muted)]">
             {selected?.filename || "—"}
           </span>
           <div className="flex items-center gap-2 font-mono text-[11px]">
@@ -629,15 +653,44 @@ function PreviewTab({ docs, selected, setSelected, ex }) {
             >
               ›
             </button>
+            {fileUrl && (
+              <a
+                href={fileUrl}
+                target="_blank"
+                rel="noreferrer"
+                data-testid="open-pdf-new-tab"
+                className="ml-2 border border-[var(--cv-border)] px-2 py-0.5 hover:border-[var(--cv-primary)] hover:text-[var(--cv-primary)]"
+              >
+                open ↗
+              </a>
+            )}
           </div>
         </div>
-        <iframe
-          key={fileUrl}
-          title="pdf-preview"
-          data-testid="pdf-preview-iframe"
-          src={fileUrl || "about:blank"}
-          className="h-[720px] w-full border border-[var(--cv-border)] bg-black"
-        />
+        {fileUrl ? (
+          <object
+            key={fileUrl}
+            data={fileUrl}
+            type="application/pdf"
+            data-testid="pdf-preview-object"
+            className="h-[720px] w-full border border-[var(--cv-border)] bg-black"
+          >
+            <iframe
+              title="pdf-preview"
+              data-testid="pdf-preview-iframe"
+              src={fileUrl}
+              className="h-[720px] w-full border border-[var(--cv-border)] bg-black"
+            />
+            <div className="border border-[var(--cv-border)] bg-[var(--cv-surface)] p-6 font-mono text-xs text-[var(--cv-muted)]">
+              Inline PDF preview unsupported by this browser.{" "}
+              <a href={fileUrl} target="_blank" rel="noreferrer" className="text-[var(--cv-primary)] underline">
+                Open the PDF in a new tab
+              </a>
+              .
+            </div>
+          </object>
+        ) : (
+          <div className="h-[720px] w-full border border-[var(--cv-border)] bg-black" />
+        )}
       </div>
     </section>
   );

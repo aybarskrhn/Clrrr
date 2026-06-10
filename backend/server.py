@@ -3,11 +3,12 @@ import csv
 import io
 import logging
 import os
+import re
 import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
@@ -22,10 +23,11 @@ load_dotenv(ROOT_DIR / ".env")
 
 from ai_service import answer_question_with_pdf, extract_pdf, summarize_deal  # noqa: E402
 from analysis_pipeline import (  # noqa: E402
-    answer_with_citations,
+    _extract_row_reasoning,
+    answer_with_citations,  # noqa: F401  (kept for backwards-compat / future use)
     markdown_table_to_csv,
-    retrieve_chunks,
 )
+from provenance import extract_table_from_answer, resolve_table_provenance  # noqa: E402
 from extractor import (  # noqa: E402
     extract_page_text,
     page_count as pdf_page_count,
